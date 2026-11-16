@@ -76,6 +76,12 @@ static char  eq_personal[16] = "ZcashPoW";
 // Every solution is re-verified on the host before submit, so a solver defect
 // costs a local reject rather than a bad share.
 static void* equi24b_ctx[MAX_GPUS] = { NULL };
+// Queued solves (oldest first) and the headers they were launched for. They
+// survive a return from scanhash and are kept if the next call's header differs
+// at most in the nonce words.
+static void*    equi24b_pipe[MAX_GPUS] = { NULL };
+static uint32_t eq_pend_hdr[MAX_GPUS][2][35];
+static int      eq_pend_n[MAX_GPUS] = { 0 };
 
 // Throughput meter for the 144/5 and 192/7 path, rate-limited to one line per 5 s.
 // sol/nonce (expect ~2) is reported too: dropped pairs lower it, Sol/s cannot show that.
@@ -209,6 +215,28 @@ static void tromp_emit(void* ud, const uint32_t* idx, uint32_t proofsize)
 	}
 }
 
+static bool eq24_launch(int thr_id, const uint32_t *hdr)
+{
+	const int n = eq_pend_n[thr_id];
+	const int rc = (eq_wk == 7)
+		? equi24b_192_launch(equi24b_ctx[thr_id], equi24b_pipe[thr_id], (const char*) hdr, eq_personal)
+		: equi24b_144_launch(equi24b_ctx[thr_id], equi24b_pipe[thr_id], (const char*) hdr, eq_personal);
+	if (rc) {
+		gpulog(LOG_WARNING, thr_id, "equi24b launch failed (%d)", rc);
+		return false;
+	}
+	memcpy(eq_pend_hdr[thr_id][n], hdr, 140);
+	eq_pend_n[thr_id] = n + 1;
+	return true;
+}
+
+static void eq24_reset(int thr_id)
+{
+	if (eq_wk == 7) equi24b_192_pipe_reset(equi24b_pipe[thr_id]);
+	else            equi24b_144_pipe_reset(equi24b_pipe[thr_id]);
+	eq_pend_n[thr_id] = 0;
+}
+
 static int scanhash_equihash_dig24(int thr_id, struct work *work, uint32_t max_nonce, unsigned long *hashes_done)
 {
 	uint32_t _ALIGN(64) endiandata[35];
@@ -230,7 +258,8 @@ static int scanhash_equihash_dig24(int thr_id, struct work *work, uint32_t max_n
 		const size_t need = (eq_wk == 7) ? equi24b_192_arena_needed()
 		                                 : equi24b_144_arena_needed();
 		equi24b_ctx[thr_id] = (eq_wk == 7) ? equi24b_192_init() : equi24b_144_init();
-		if (!equi24b_ctx[thr_id]) {
+		equi24b_pipe[thr_id] = (eq_wk == 7) ? equi24b_192_pipe_new() : equi24b_144_pipe_new();
+		if (!equi24b_ctx[thr_id] || !equi24b_pipe[thr_id]) {
 			gpulog(LOG_ERR, thr_id, "equihash%d/%d needs a %.2f GiB arena and it could "
 			       "not be allocated", eq_wn, eq_wk, (double)need / (1 << 30));
 			proper_exit(EXIT_CODE_CUDA_ERROR);
@@ -249,14 +278,36 @@ static int scanhash_equihash_dig24(int thr_id, struct work *work, uint32_t max_n
 	memcpy(endiandata, pdata, 140);
 	work->valid_nonces = 0;
 
+	// Queued solves carry over when only the two nonce words the miner loop steps
+	// between calls differ (data[30], data[31] with the GPU id in its top byte):
+	// they continue their own nonce sequence, and a reset starts a fresh one.
+	if (eq_pend_n[thr_id]) {
+		const uint32_t *q = eq_pend_hdr[thr_id][0];
+		if (memcmp(q, endiandata, NONCE_OFT * 4) ||
+		    memcmp(q + NONCE_OFT + 2, endiandata + NONCE_OFT + 2, 140 - (NONCE_OFT + 2) * 4))
+			eq24_reset(thr_id);
+	}
+	if (!eq_pend_n[thr_id] && !eq24_launch(thr_id, endiandata))
+		goto out;
+
 	do {
+		// queue the next nonce first, so the GPU works while this one is checked
+		if (eq_pend_n[thr_id] == 1 && !work_restart[thr_id].restart) {
+			uint32_t next[35];
+			memcpy(next, eq_pend_hdr[thr_id][0], 140);
+			next[NONCE_OFT] += nonce_increment;
+			eq24_launch(thr_id, next);
+		}
+		memcpy(endiandata, eq_pend_hdr[thr_id][0], 140);
+		memcpy(eq_pend_hdr[thr_id][0], eq_pend_hdr[thr_id][1], 140);
+		eq_pend_n[thr_id]--;
+
 		tromp_ns[thr_id] = 0;
+		unsigned dr[4] = { 0, 0, 0, 0 };
 		int nsol;
 		nsol = (eq_wk == 7)
-			? equi24b_192_solve(equi24b_ctx[thr_id], (const char*) endiandata,
-			                    eq_personal, tromp_emit, &thr_id)
-			: equi24b_144_solve(equi24b_ctx[thr_id], (const char*) endiandata,
-			                    eq_personal, tromp_emit, &thr_id);
+			? equi24b_192_collect(equi24b_ctx[thr_id], equi24b_pipe[thr_id], tromp_emit, &thr_id, dr)
+			: equi24b_144_collect(equi24b_ctx[thr_id], equi24b_pipe[thr_id], tromp_emit, &thr_id, dr);
 		soluce_count += (nsol > 0 ? nsol : 0);
 		eq_m_sols[thr_id] += (uint32_t) (nsol > 0 ? nsol : 0); // every solver solution, not just submitted ones
 		*hashes_done = soluce_count;
@@ -265,9 +316,6 @@ static int scanhash_equihash_dig24(int thr_id, struct work *work, uint32_t max_n
 		// solutions included), and the heap counters report dropped items.
 		unsigned clamped = 0;
 		{
-			unsigned dr[4];
-			if (eq_wk == 7) equi24b_192_drops(equi24b_ctx[thr_id], dr);
-			else            equi24b_144_drops(equi24b_ctx[thr_id], dr);
 			clamped = dr[3];
 			// Scatter overflow is the expected bucket-fill tail (negligible loss);
 			// staging overflow means the shared-memory sizing is wrong.
@@ -334,8 +382,6 @@ static int scanhash_equihash_dig24(int thr_id, struct work *work, uint32_t max_n
 			if (work->valid_nonces) goto out;
 		}
 
-		endiandata[NONCE_OFT] += nonce_increment;
-
 		// rate-limited: per-solve I/O would skew the measurement
 		eq_m_nonces[thr_id]++;
 		{
@@ -365,7 +411,9 @@ out:
 	gpulog(LOG_DEBUG, thr_id, "%d solutions in %.2f s (%.2f Sol/s)",
 	       soluce_count, secs, secs > 0 ? soluce_count / secs : 0.0);
 	*hashes_done = soluce_count;
-	pdata[NONCE_OFT] = endiandata[NONCE_OFT] + 1;
+	// resume at the queued nonce, so the next call collects that solve
+	pdata[NONCE_OFT] = eq_pend_n[thr_id] ? eq_pend_hdr[thr_id][0][NONCE_OFT]
+	                                     : endiandata[NONCE_OFT] + nonce_increment;
 	return work->valid_nonces;
 }
 

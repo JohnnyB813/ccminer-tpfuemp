@@ -2534,9 +2534,13 @@ static void *miner_thread(void *userdata)
 			// The tick is not removed: stratum_gen_work() fails while job_id is null
 			// and leaves g_work_time alone, so this condition stays true and a
 			// sleepless loop would spin on a pool that has not sent a job yet.
+			// Equihash with a job in hand skips the tick, which would only idle the
+			// card: the regen below keeps the job, and its nonce space is not used up.
 			if (!work_done && !range_done && time(NULL) >= (g_work_time + opt_scantime)) {
-				usleep(100*1000);
-				sleeptime = 1;
+				if (opt_algo != ALGO_EQUIHASH || !stratum.job.job_id) {
+					usleep(100*1000);
+					sleeptime = 1;
+				}
 				extrajob = true;
 			}
 			if (sleeptime && opt_debug && !opt_quiet)
