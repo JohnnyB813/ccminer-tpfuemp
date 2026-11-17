@@ -1,21 +1,14 @@
 /*
- * HoohashV110 (PEPEPOW) — ccminer host glue (scanhash + free).
+ * HoohashV110 (PEPEPOW) - ccminer host glue (scanhash + free).
  *
- * Device kernels/launchers live in cuda_hoohashv110.cu (kept separate to avoid the
- * thrust/miner.h macro clash). Byte order verified against a real PEPEPOW block
- * (height 0x4734dd) by both the CPU and CUDA ports:
- *   - Input : be32enc the 20 work words -> raw 80-byte header (ver word 0x00400020
- *             -> bytes 00 40 00 20).
- *   - Output: HoohashV110 digest is BIG-ENDIAN (byte 0 = MSB); the kernel stores it
- *             byte-reversed so cuda_check_hash / fulltest (word 7 = MSB) work.
- *   - Difficulty: plain 0xffff base (no 256x factor) -> set in ccminer.cpp.
+ *   - Input : be32enc the 20 work words -> raw 80-byte header.
+ *   - Output: the digest is big-endian; the kernel stores it byte-reversed so
+ *             cuda_check_hash / fulltest (word 7 = MSB) work.
+ *   - Difficulty: 2^16 share-target factor, set in ccminer.cpp.
  *
- * CONSENSUS-CRITICAL DIVERGENCE from the usual ccminer pattern: candidates are NOT
- * re-hashed on the CPU. On Windows the CPU would link MSVC libm, which differs from
- * the consensus libm (glibc) at large-arg sin/cos, so a CPU recheck would REJECT the
- * GPU's correct shares. Instead we trust the GPU digest (read it back from d_hash and
- * fulltest that). A GPU startup self-test against the real-block KAT verifies this
- * GPU's libdevice matches consensus.
+ * Candidates are NOT re-hashed on the CPU: MSVC libm differs from consensus libm
+ * (glibc) for large sin/cos arguments and would reject valid shares. The GPU digest
+ * is read back and checked instead; the init self-test guards the GPU's libdevice.
  */
 #include "miner.h"
 #include "cuda/helper.cuh"
@@ -43,8 +36,7 @@ extern "C" int scanhash_hoohash(int thr_id, struct work* work, uint32_t max_nonc
 	if (init[thr_id])
 		throughput = min(throughput, max_nonce - first_nonce);
 
-	// 0x00ff is unreachable over the single window --benchmark scans, which
-	// left the candidate readback and fulltest dead. Loosened so they run.
+	// loose enough to produce candidates within the fixed benchmark window
 	if (opt_benchmark)
 		((uint32_t*)ptarget)[7] = 0x0000ffff;
 
@@ -58,8 +50,7 @@ extern "C" int scanhash_hoohash(int thr_id, struct work* work, uint32_t max_nonc
 		gpulog(LOG_INFO, thr_id, "Intensity set to %g, %u cuda threads",
 			throughput2intensity(throughput), throughput);
 
-		// Fail-closed: no host re-verify exists for this algo, so a GPU that
-		// misses the KAT would mine local rejects all session, silently.
+		// fail-closed: exits on a KAT mismatch
 		if (hoohash_device_selftest(thr_id))
 			gpulog(LOG_INFO, thr_id, "HoohashV110 self-test OK (real-block KAT + negative)");
 
@@ -75,7 +66,7 @@ extern "C" int scanhash_hoohash(int thr_id, struct work* work, uint32_t max_nonc
 		be32enc(&endiandata[k], pdata[k]);
 
 	hoohash_setBlock(endiandata);
-	hoohash_gen_matrix();           // matrix is nonce-independent -> generate once per job
+	hoohash_gen_matrix();           // nonce-independent: once per scan call
 	cuda_check_cpu_setTarget(ptarget);
 
 	do {
@@ -120,9 +111,7 @@ extern "C" int scanhash_hoohash(int thr_id, struct work* work, uint32_t max_nonc
 			}
 			else
 			{
-				// Catches EVERY non-accepting case. As "else if (vhash[7] > Htarg)" a
-				// digest that passed the screen but failed fulltest matched neither
-				// branch: no reject, no log. Resuming at nonces[0]+1 re-scans the tail.
+				// also the screen-pass/fulltest-fail case; resume re-scans the tail
 				gpu_increment_reject(thr_id);
 				if (!opt_quiet)
 					gpulog(LOG_WARNING, thr_id, "result for %08x does not validate!", work->nonces[0]);

@@ -1,40 +1,28 @@
-# hoohash — HoohashV110 (PEPEPOW)
-
-Relocated from the top-level `hoohash/` into `algos/hoohash/` (layout B). This was
-a **relocation-only** migration: hoohash is a self-contained standalone algo with
-its own device library, not part of any shared-stage family, and nothing outside
-this folder consumes its symbols (only the usual `scanhash_hoohash` / `free_hoohash`
-dispatcher wiring in `ccminer.cpp` / `core/bench.cpp` / `miner.h` / `algos.h`).
+# hoohash - HoohashV110 (PEPEPOW)
 
 ## Files
 
-- `hoohash.cu` — scan driver (`scanhash_hoohash`, `free_hoohash`).
-- `cuda_hoohashv110.cu` — the HoohashV110 device translation unit
-  (`hoo_generateMatrix` / `hoo_matmul` + the on-device hash).
-- `hoohash_device.cuh` — device helpers.
-- `blake3_hoo_device.cuh` — bundled BLAKE3 used by the matrix step.
+- `hoohash.cu` - scan driver (`scanhash_hoohash`, `free_hoohash`).
+- `cuda_hoohashv110.cu` - device kernels, launchers and the init self-test.
+- `hoohash_device.cuh` - matrix generation, the transforms and the branch predicate;
+  BLAKE3 comes from the shared `cuda/blake3_device.cuh`.
 
 ## Consensus-critical strict floating point
 
 `cuda_hoohashv110.cu` **must** be compiled with strict FP so the on-device
-transcendentals match the CPU/glibc oracle bit-for-bit. Both build systems carry
-this verbatim; do not "clean it up":
+transcendentals match the consensus reference (glibc libm) bit-for-bit. Both build
+systems carry this per file; do not "clean it up":
 
 - MSBuild: `FastMath=false`, `FmadOptimization=false`,
-  `--fmad=false --prec-div=true --prec-sqrt=true --ftz=false`
-  (plus `-allow-unsupported-compiler` / `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH`).
+  `--fmad=false --prec-div=true --prec-sqrt=true --ftz=false`.
 - Autotools: dedicated rule `algos/hoohash/cuda_hoohashv110.o` with
   `--maxrregcount=128 --fmad=false --prec-div=true --prec-sqrt=true --ftz=false`.
 
-Per `docs/coding-guideline.md`, this algo's KAT is re-run **per target arch**
-(libdevice transcendentals are compiled per `sm_*` and can differ in the last ULP).
+There is no CPU re-verify of shares (a non-glibc libm would reject valid ones), so
+the fail-closed init self-test (a real block's published digest) is the consensus
+guard. Per `docs/coding-guideline.md` it runs on every target arch, since libdevice
+code is compiled per `sm_*`.
 
-## Migration notes
-
-Two **repo-root-relative** includes were repointed to the new location (they
-resolve via the root include dir, not source-relative):
-
-- `cuda_hoohashv110.cu`: `"hoohash/hoohash_device.cuh"` → `"algos/hoohash/hoohash_device.cuh"`
-- `hoohash_device.cuh`: `"hoohash/blake3_hoo_device.cuh"` → `"algos/hoohash/blake3_hoo_device.cuh"`
-
-`hoohash.cu` uses only search-path includes (`miner.h`, `cuda/helper.cuh`) — no edit.
+The mining kernel lets each lane walk its own position in the 64x64 scan and evaluates
+the expensive transform for all waiting lanes together (`HOO_WAIT_K`, tuned per arch);
+results are bit-identical to the reference.

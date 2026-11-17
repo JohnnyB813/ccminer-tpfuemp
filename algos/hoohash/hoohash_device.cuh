@@ -1,4 +1,4 @@
-// HoohashV110 (PEPEPOW) — CUDA device port
+// HoohashV110 (PEPEPOW) - CUDA device port
 //
 // Faithful translation of the consensus C reference
 // (Hoosat crypto/hoohash/hoohash.c,
@@ -8,21 +8,18 @@
 // integer-only, all static, so several TUs may include it.
 //
 // Consensus-critical notes:
-//  * The 64x64 double matmul is INHERENTLY SEQUENTIAL: the running scalar `sw`
-//    and the accumulator `product[i]` carry across all 64*64 iterations, and the
-//    branch (sw <= 0.02) depends on them. => one thread per nonce candidate.
+//  * The 64x64 scan is sequential per nonce: the row sum and `sw` carry across all
+//    iterations and the branch (sw <= 0.02) depends on them.
 //  * SafeComplexTransform's while-loop never recomputes `transformedValue`; on the
 //    NaN/Inf path it only shrinks `input` until it returns 0. Net effect:
 //    finite ? ComplexNonLinear(input) : 0  (rounds always ends 1 on the finite path).
 //    Replicated verbatim so any future edge case matches the reference bit-for-bit.
-//  * (uint64_t)product[i]: product[i] is provably >= 0 and small (every transform
+//  * (uint64_t)rowsum: every row sum is provably >= 0 and small (every transform
 //    branch returns >= 0; vector,multiplier,divider,mat all >= 0), so the GPU's
 //    saturating float->uint conversion cannot diverge from x86 here.
-//  * THE FP-determinism risk is sin/cos of LARGE arguments (input can reach ~6e16:
-//    mat<=1e6 * hashXor<=~4e9 * vector<=15). exp/sqrt/floor/fabs are safe. This
-//    header uses NATIVE double transcendentals; consensus parity vs the glibc
-//    oracle is validated separately (a real-block KAT) before any software sin/cos
-//    replacement is introduced.
+//  * The FP-determinism risk is sin/cos of LARGE arguments (up to ~6e16:
+//    mat<=1e6 * hashXor<=~4e9 * vector<=15). Native double transcendentals are
+//    used; their parity with glibc is checked by the init self-test.
 #pragma once
 #include <stdint.h>
 #include <math.h>
@@ -66,11 +63,8 @@ __device__ __forceinline__ uint64_t hoo_xoshiro_gen(hoo_xoshiro* x) {
 
 // --- nonlinear transforms (native transcendentals) ---
 __device__ __forceinline__ double hoo_Medium(double x) {
-    // sincos() does ONE Payne-Hanek argument reduction for both sin and cos, vs two
-    // separate reductions for sin(x)+cos(x). libdevice __nv_sincos shares the core
-    // reduction/polynomials with __nv_sin/__nv_cos, so it is BIT-IDENTICAL to the
-    // separate calls here — verified by a 1M-nonce old-vs-new GPU differential (0 diffs)
-    // plus the real-block KAT tying the baseline to the consensus (glibc) digest.
+    // One argument reduction for both; bit-identical to separate sin()/cos() calls
+    // (libdevice shares the reduction and polynomials).
     double s, c;
     sincos(x, &s, &c);
     return exp(s + c);
@@ -123,13 +117,21 @@ __device__ double hoo_SafeComplexTransform(double input) {
     return transformedValue * rounds;
 }
 
-__device__ __forceinline__ double hoo_TransformFactor(double x) {
-    const double granularity = 1024.0;
-    return x / granularity - floor(x / granularity);
+// sw = frac(p / 1024) <= 0.02 for finite p >= 0, evaluated exactly on the bit pattern:
+// p / 1024 and frac are exact, so this is (p mod 1024) <= 1024 * 0.02.
+__device__ __forceinline__ bool hoo_sw_low(double p) {
+    const uint64_t b  = (uint64_t)__double_as_longlong(p);
+    const uint64_t cb = (uint64_t)__double_as_longlong(0.02 * 1024.0);
+    const int e = (int)(b >> 52) - 1023;
+    if (e < 10) return b <= cb;       // p < 1024: the remainder is p itself
+    if (e >= 62) return true;
+    const uint64_t m   = (b & 0xFFFFFFFFFFFFFull) | (1ull << 52);
+    const uint64_t rem = m & ((1ull << (62 - e)) - 1);
+    const uint64_t cm  = (cb & 0xFFFFFFFFFFFFFull) | (1ull << 52);
+    return rem <= (cm >> (e - ((int)(cb >> 52) - 1023)));
 }
 
-// Fills mat[][] and matdiv[][] = mat[][] * divider in one pass: the matmul's cheap
-// branch needs only that product, which the reference forms as an intermediate.
+// Fills mat[][] and matdiv[][] = mat[][] * divider (the cheap step's intermediate).
 __device__ void hoo_generateMatrix(const uint8_t* seed, double mat[64][64],
                                    double matdiv[64][64]) {
     hoo_xoshiro st;
@@ -146,58 +148,4 @@ __device__ void hoo_generateMatrix(const uint8_t* seed, double mat[64][64],
             matdiv[i][j] = mat[i][j] * 0.0001;   // == the reference's `divider`
         }
     }
-}
-
-// hashBytes = firstPass (BLAKE3 of full 80-byte header). nonce = u32 LE @ offset 76.
-__device__ void hoo_matmul(double mat[64][64], double matdiv[64][64],
-                           const uint8_t* hashBytes,
-                           uint8_t* output, uint64_t nonce) {
-    uint8_t  scaledValues[32];
-    uint8_t  vector[64];
-    double   product[64];
-    uint8_t  result[32];
-    uint32_t H[8];
-
-    for (int i = 0; i < 32; i++) scaledValues[i] = 0;
-    for (int i = 0; i < 64; i++) { vector[i] = 0; product[i] = 0.0; }
-
-    for (int i = 0; i < 8; i++) H[i] = hoo_read_u32be(hashBytes + i * 4);
-    double hashXor    = (double)(H[0]^H[1]^H[2]^H[3]^H[4]^H[5]^H[6]^H[7]);
-    double nonceMod   = (double)(nonce & 0xFF);
-    double multiplier = 1234;
-    double sw         = 0.0;
-
-    for (int i = 0; i < 32; i++) {
-        vector[2 * i]     = hashBytes[i] >> 4;
-        vector[2 * i + 1] = hashBytes[i] & 0x0F;
-    }
-
-    for (int i = 0; i < 64; i++) {
-        for (int j = 0; j < 64; j++) {
-            // vector[j] == 0 makes both branches add exactly +0.0 (the transform is
-            // finite and >= 0), so product[i] and the sw derived from it are
-            // unchanged. Skipping is bit-exact; sw must still be recomputed below.
-            if (vector[j] != 0) {
-                if (sw <= 0.02) {
-                    double input     = (mat[i][j] * hashXor * (double)vector[j] + nonceMod);
-                    double out_val   = hoo_SafeComplexTransform(input) * (double)vector[j] * multiplier;
-                    product[i] += out_val;
-                } else {
-                    // matdiv = mat*divider, precomputed per job. The reference
-                    // evaluates left to right, so this is the same intermediate.
-                    double out_val   = matdiv[i][j] * (double)vector[j];
-                    product[i] += out_val;
-                }
-            }
-            sw = hoo_TransformFactor(product[i]);
-        }
-    }
-
-    for (int i = 0; i < 64; i += 2) {
-        uint64_t pval     = (uint64_t)product[i] + (uint64_t)product[i + 1];
-        scaledValues[i / 2] = (uint8_t)(pval & 0xFF);
-    }
-    for (int i = 0; i < 32; i++) result[i] = hashBytes[i] ^ scaledValues[i];
-
-    blake3_256(result, 32, output);
 }

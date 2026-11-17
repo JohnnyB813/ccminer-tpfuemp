@@ -1,25 +1,17 @@
 /*
- * HoohashV110 (PEPEPOW) — CUDA device kernels + launchers.
+ * HoohashV110 (PEPEPOW) - CUDA device kernels + launchers.
  *
- * Kept SEPARATE from the host scanhash glue (hoohash.cu): the device path includes
- * hoohash_device.cuh; this TU includes ONLY cuda_runtime + the device headers, while
- * the host glue includes miner.h (avoids macro clashes).
- *
- * PERF: matrixSeed = BLAKE3(header with nonce zeroed) is NONCE-INDEPENDENT, so the
- * 64x64 double matrix is identical for every nonce in a job. We generate it ONCE per
- * job (hoohash_gen_matrix -> d_hoo_matrix in device global) instead of per-thread; the
- * mining kernel then only does the nonce-dependent firstPass + matmul. The matmul's
- * mat[i][j] access is uniform across a warp (the i,j loop is nonce-independent), so the
- * single global matrix is a broadcast/L2-friendly read.
+ * The 64x64 matrix depends only on the nonce-zeroed header, so it is generated once
+ * per scan call (hoohash_gen_matrix) and read warp-uniformly by the mining kernel.
  *
  * MUST be compiled with strict FP (no --use_fast_math; --fmad=false --prec-div=true
- * --prec-sqrt=true --ftz=false) — see the per-file build settings.
+ * --prec-sqrt=true --ftz=false) - see the per-file build settings.
  */
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <string.h>
 
-#include "algos/hoohash/hoohash_device.cuh"  // hoo_generateMatrix / hoo_matmul / bundled BLAKE3
+#include "algos/hoohash/hoohash_device.cuh"  // matrix generation, transforms, hoo_sw_low
 #include "cuda/selftest_gate.cuh"            // selftest_gate / selftest_cuda_fault
 
 // 80-byte header (be32enc'd consensus serialization); mining kernel overwrites nonce @76..79.
@@ -27,9 +19,10 @@ __constant__ uint8_t c_hoohash_header[80];
 
 // Per-job matrix, generated once from the (nonce-zeroed) header. Per-device global.
 __device__ double d_hoo_matrix[64][64];
-// mat[i][j] * divider, precomputed with the matrix so the cheap branch of the
-// matmul does not repeat the multiply per iteration.
+// mat[i][j] * divider, the reference's intermediate for the cheap step.
 __device__ double d_hoo_matrix_div[64][64];
+// matdiv * v for every nibble value v: the cheap step's addend.
+__device__ double d_hoo_tab[16 * 4096];
 
 // Generate the per-job matrix: matrixSeed = BLAKE3(header80 with nonce bytes zeroed),
 // then xoshiro-fill d_hoo_matrix. xoshiro is a sequential stream -> single thread.
@@ -48,13 +41,35 @@ __global__ void hoohash_gen_matrix_kernel()
 	}
 }
 
-// Per-nonce: firstPass = BLAKE3(full header), matmul against the precomputed matrix.
+__global__ void hoohash_tab_kernel()
+{
+	const int k = blockIdx.x * blockDim.x + threadIdx.x;
+	const double md = (&d_hoo_matrix_div[0][0])[k];
+	for (int v = 0; v < 16; v++) d_hoo_tab[v * 4096 + k] = md * (double)v;
+}
+
+static void hoohash_gen_all(void)
+{
+	hoohash_gen_matrix_kernel<<<1, 1>>>();
+	hoohash_tab_kernel<<<64, 64>>>();
+}
+
+// Run a transform phase once this many lanes wait (or none can step); tuned per arch.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
+#define HOO_WAIT_K 14
+#else
+#define HOO_WAIT_K 24
+#endif
+
+// Per-nonce: firstPass = BLAKE3(full header), then the 64x64 scan. Each lane walks its own
+// (i, j) in reference order; lanes needing the transform wait and are evaluated together.
 // Digest stored BYTE-REVERSED so cuda_check_hash / fulltest (word7 = MSB) compare the
 // big-endian digest correctly. cuda_checkhash_64 strides 64-byte (16-word) slots.
 __global__ void hoohash_gpu_hash(uint32_t threads, uint32_t startNonce, uint32_t* outputHash)
 {
-	uint32_t thread = blockDim.x * blockIdx.x + threadIdx.x;
-	if (thread >= threads) return;
+	const unsigned lanes = __activemask();
+	const uint32_t thread = blockDim.x * blockIdx.x + threadIdx.x;
+	const bool live = thread < threads;   // tail lanes still take part in the votes
 
 	uint8_t header[80];
 	#pragma unroll
@@ -70,14 +85,58 @@ __global__ void hoohash_gpu_hash(uint32_t threads, uint32_t startNonce, uint32_t
 	uint8_t firstPass[32];
 	blake3_256(header, 80, firstPass);
 
-	uint64_t non = (uint64_t)hoo_read_u32le(header + 76);
+	uint32_t H[8];
+	for (int k = 0; k < 8; k++) H[k] = hoo_read_u32be(firstPass + k * 4);
+	const double hashXor = (double)(H[0] ^ H[1] ^ H[2] ^ H[3] ^ H[4] ^ H[5] ^ H[6] ^ H[7]);
+	const double nonceMod = (double)(hoo_read_u32le(header + 76) & 0xFF);
+	const double multiplier = 1234;
 
-	uint8_t digest[32];
-	hoo_matmul(d_hoo_matrix, d_hoo_matrix_div, firstPass, digest, non);
+	uint8_t vec[64];
+	for (int k = 0; k < 32; k++) { vec[2 * k] = firstPass[k] >> 4; vec[2 * k + 1] = firstPass[k] & 0x0F; }
+
+	uint8_t scaled[32];
+	int i = live ? 0 : 64, j = 0;
+	double prod = 0.0;
+	bool low = true;          // sw <= 0.02; sw starts at 0 and carries across rows
+	uint64_t pend = 0;
+
+	for (;;) {
+		const bool done = (i >= 64);
+		const uint8_t v = done ? 0 : vec[j];
+		const bool needT = !done && v != 0 && low;   // v == 0 adds exactly +0.0 on either branch
+		const unsigned mT = __ballot_sync(lanes, needT);
+		const unsigned mC = __ballot_sync(lanes, !done && !needT);
+		if (!(mT | mC)) break;
+		bool step = false;
+		if (mT && (__popc(mT) >= HOO_WAIT_K || !mC)) {
+			if (needT) {
+				const double input = (d_hoo_matrix[i][j] * hashXor * (double)v + nonceMod);
+				prod += hoo_SafeComplexTransform(input) * (double)v * multiplier;
+				step = true;
+			}
+		} else if (!done && !needT) {
+			if (v) prod += d_hoo_tab[v * 4096 + i * 64 + j];
+			step = true;
+		}
+		if (step) {
+			low = hoo_sw_low(prod);
+			if (++j == 64) {
+				const uint64_t pv = (uint64_t)prod;
+				if (i & 1) scaled[i >> 1] = (uint8_t)((pend + pv) & 0xFF);
+				else pend = pv;
+				i++; j = 0; prod = 0.0;
+			}
+		}
+	}
+	if (!live) return;
+
+	uint8_t result[32], digest[32];
+	for (int k = 0; k < 32; k++) result[k] = firstPass[k] ^ scaled[k];
+	blake3_256(result, 32, digest);
 
 	uint8_t* out = (uint8_t*)(outputHash + thread * 16);
 	#pragma unroll
-	for (int i = 0; i < 32; i++) out[i] = digest[31 - i];
+	for (int k = 0; k < 32; k++) out[k] = digest[31 - k];
 }
 
 extern "C" void hoohash_setBlock(const void* endiandata)
@@ -87,7 +146,7 @@ extern "C" void hoohash_setBlock(const void* endiandata)
 
 extern "C" void hoohash_gen_matrix(void)
 {
-	hoohash_gen_matrix_kernel<<<1, 1>>>();
+	hoohash_gen_all();
 }
 
 extern "C" void hoohash_cpu_hash(uint32_t threads, uint32_t startNonce, uint32_t* d_hash, uint32_t tpb)
@@ -97,9 +156,8 @@ extern "C" void hoohash_cpu_hash(uint32_t threads, uint32_t startNonce, uint32_t
 	hoohash_gpu_hash<<<grid, block>>>(threads, startNonce, d_hash);
 }
 
-// Real-block KAT (height 0x4734dd). Validates THIS GPU's libdevice == consensus libm
-// (glibc) before mining; see hoohash-real-block-kat. Header is the raw 80-byte on-chain
-// serialization; expected is the big-endian digest (= block hash, under target).
+// Real-block KAT (height 0x4734dd): this GPU's libdevice must match consensus libm (glibc).
+// Header is the raw 80-byte on-chain serialization; expected is the big-endian block hash.
 static const uint8_t hoohash_kat_header[80] = {
 	0x00,0x40,0x00,0x20, 0xdf,0x13,0xf8,0xc7, 0x24,0x3b,0x6b,0x22, 0x6c,0x33,0x99,0xf4,
 	0x85,0xe9,0x02,0x34, 0x7e,0x41,0xba,0x37, 0x0e,0x0c,0x8f,0xea, 0x75,0x67,0x2f,0x45,
@@ -112,13 +170,12 @@ static const uint8_t hoohash_kat_expected[32] = {
 	0xaf,0x06,0xbc,0x1b, 0x9f,0x26,0xd6,0xa9, 0x94,0xb6,0x5e,0xb6, 0x6d,0x17,0x84,0x5d
 };
 
-// One header through the ACTUAL mining path, so the legs below validate what
-// mines. Returns false only when CUDA itself failed -- not a wrong hash.
+// One header through the mining kernels. Returns false only on a CUDA failure.
 static bool hoohash_kat_run(const uint8_t hdr[80], uint32_t nonce, uint8_t out_be[32])
 {
 	if (cudaMemcpyToSymbol(c_hoohash_header, hdr, 80, 0, cudaMemcpyHostToDevice) != cudaSuccess)
 		return selftest_cuda_fault();
-	hoohash_gen_matrix_kernel<<<1, 1>>>();
+	hoohash_gen_all();
 
 	uint32_t* d_out = NULL;
 	if (cudaMalloc(&d_out, 16 * sizeof(uint32_t)) != cudaSuccess)
@@ -129,25 +186,22 @@ static bool hoohash_kat_run(const uint8_t hdr[80], uint32_t nonce, uint8_t out_b
 		return selftest_cuda_fault();
 	}
 
-	// Copy only what the kernel writes: the 32-byte digest in the first half of
-	// its 64-byte slot. Taking the whole slot reads uninitialised device memory.
+	// Only the first 32 bytes of the 64-byte slot are written.
 	uint32_t got[8];
 	cudaError_t err = cudaMemcpy(got, d_out, sizeof(got), cudaMemcpyDeviceToHost);
 	cudaFree(d_out);
 	if (err != cudaSuccess)
 		return selftest_cuda_fault();
 
-	// Those 32 bytes hold the REVERSED digest; un-reverse to big-endian.
+	// Stored byte-reversed; un-reverse to big-endian.
 	const uint8_t* gr = (const uint8_t*)got;
 	for (int i = 0; i < 32; i++) out_be[i] = gr[31 - i];
 	return true;
 }
 
-// Init self-test, fail-closed. This algo has no host re-verify (MSVC libm !=
-// consensus glibc), so these two legs are its entire consensus guard.
-//   kat - real block 0x4734dd through the shipping path, published on-chain.
-//   neg - a flipped header bit must change the digest, or a kernel ignoring
-//         the header would pass kat by luck.
+// Init self-test, fail-closed (there is no host re-verify for this algo).
+//   kat - the real block above must hash to its published digest.
+//   neg - a flipped header bit must change the digest.
 extern "C" bool hoohash_device_selftest(int thr_id)
 {
 	uint8_t got[32], neg[32];
@@ -164,7 +218,7 @@ extern "C" bool hoohash_device_selftest(int thr_id)
 
 	// Never leave the flipped header or its matrix in the device symbols.
 	cudaMemcpyToSymbol(c_hoohash_header, hoohash_kat_header, 80, 0, cudaMemcpyHostToDevice);
-	hoohash_gen_matrix_kernel<<<1, 1>>>();
+	hoohash_gen_all();
 
 	const bool passed = kat_ok && neg_ok;
 	if (!passed)
