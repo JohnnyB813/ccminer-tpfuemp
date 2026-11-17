@@ -48,6 +48,10 @@ __device__ static uint32_t *S;
 __device__ static uint32_t *V;
 __device__ static uint32_t *sha256;
 
+/* counted result slots: [0] = candidates found, [1..YS_SLOTS] = their nonces
+ * (atomicAdd order). Two exchanged slots lost a third candidate and came back
+ * unordered; 0 doubled as "none", so nonce 0 could never be reported. */
+#define YS_SLOTS 8
 static uint32_t *d_gnounce[MAX_GPUS];
 static uint32_t *d_GNonce[MAX_GPUS];
 
@@ -405,7 +409,7 @@ __global__ void yescrypt_gpu_hash_k0(int threads, uint32_t startNonce, const uin
 }
 
 __launch_bounds__(32, 1)
-__global__ void yescrypt_gpu_hash_k5(int threads, uint32_t startNonce, uint32_t *nonceVector, uint32_t target, const uint32_t r, const uint32_t p)
+__global__ void yescrypt_gpu_hash_k5(int threads, uint32_t valid, uint32_t startNonce, uint32_t *nonceVector, uint32_t target, const uint32_t r, const uint32_t p)
 {
 	int thread = (blockDim.x * blockIdx.x + threadIdx.x);
 
@@ -527,11 +531,13 @@ __global__ void yescrypt_gpu_hash_k5(int threads, uint32_t startNonce, uint32_t 
 		buf[4] = 0x510E527F; buf[5] = 0x9B05688C; buf[6] = 0x1F83D9AB; buf[7] = 0x5BE0CD19;
 		sha256_round_body(in, buf);	// length = 32 * 8 = 256 = 0x100
 
-		if (cuda_swab32(buf[7]) <= target)
+		// lanes at or past `valid` pad the launch to a multiple of 32 and lie
+		// past the end of the scan range: hashed, never reported
+		if ((uint32_t) thread < valid && cuda_swab32(buf[7]) <= target)
 		{
-			uint32_t tmp = atomicExch(&nonceVector[0], nonce);
-			if (tmp != 0)
-				nonceVector[1] = tmp;
+			const uint32_t slot = atomicAdd(&nonceVector[0], 1u);
+			if (slot < YS_SLOTS)
+				nonceVector[1 + slot] = nonce;
 		}
 	}
 }
@@ -1086,8 +1092,8 @@ void yescrypt_cpu_init(int thr_id, int threads, uint32_t *d_hash1, uint32_t *d_h
 	cudaMemcpyToSymbol(sha256, &d_hash4, sizeof(d_hash4), 0, cudaMemcpyHostToDevice);
 	cudaMemcpyToSymbol(c_K, cpu_K, sizeof(cpu_K), 0, cudaMemcpyHostToDevice);
 
-	CUDA_SAFE_CALL(cudaMalloc(&d_GNonce[thr_id], 2 * sizeof(uint32_t)));
-	CUDA_SAFE_CALL(cudaMallocHost(&d_gnounce[thr_id], 2 * sizeof(uint32_t)));
+	CUDA_SAFE_CALL(cudaMalloc(&d_GNonce[thr_id], (1 + YS_SLOTS) * sizeof(uint32_t)));
+	CUDA_SAFE_CALL(cudaMallocHost(&d_gnounce[thr_id], (1 + YS_SLOTS) * sizeof(uint32_t)));
 }
 
 __host__
@@ -1136,11 +1142,14 @@ void yescrypt_setTarget(int thr_id, uint32_t pdata[20], char *key, uint32_t key_
 // PRECONDITION: threads must be a multiple of 32. The batch is tiled three ways --
 // grid = threads/tpb, k1's 4-way split by threads>>2, SMix's 16-way split by
 // threads>>4 -- and only a multiple of 32 makes all three cover exactly `threads`.
-// A non-multiple silently scans a wrong subset; the caller clamps (yescrypt.cu).
-__host__ void yescrypt_cpu_hash_32(int thr_id, uint32_t threads, uint32_t startNounce, uint32_t *resultnonces, uint32_t target, const uint32_t N, const uint32_t r, const uint32_t p)
+// A non-multiple silently scans a wrong subset; the caller pads (yescrypt.cu) and
+// passes the real count as `valid`: only lanes below it can report.
+// Stores up to min(max_results, YS_SLOTS) candidate nonces, in no particular
+// order, into resultnonces and returns how many it stored.
+__host__ uint32_t yescrypt_cpu_hash_32(int thr_id, uint32_t threads, uint32_t valid, uint32_t startNounce, uint32_t *resultnonces, uint32_t max_results, uint32_t target, const uint32_t N, const uint32_t r, const uint32_t p)
 {
 	int dev_id = device_map[thr_id % MAX_GPUS];
-	CUDA_SAFE_CALL(cudaMemset(d_GNonce[thr_id], 0, 2 * sizeof(uint32_t)));
+	CUDA_SAFE_CALL(cudaMemset(d_GNonce[thr_id], 0, sizeof(uint32_t)));
 
 	const uint32_t tpb = 32U;
 	uint32_t sm = 0;
@@ -1227,14 +1236,20 @@ __host__ void yescrypt_cpu_hash_32(int thr_id, uint32_t threads, uint32_t startN
 			}
 		}
 	}
-	yescrypt_gpu_hash_k5 << <grid, block >> > (threads, startNounce, d_GNonce[thr_id], target, r, p);
+	yescrypt_gpu_hash_k5 << <grid, block >> > (threads, valid, startNounce, d_GNonce[thr_id], target, r, p);
 	CUDA_SAFE_CALL(cudaGetLastError());
 	if (opt_debug)
 		CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
-	CUDA_SAFE_CALL(cudaMemcpy(d_gnounce[thr_id], d_GNonce[thr_id], 2 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-	resultnonces[0] = *(d_gnounce[thr_id]);
-	resultnonces[1] = *(d_gnounce[thr_id] + 1);
+	CUDA_SAFE_CALL(cudaMemcpy(d_gnounce[thr_id], d_GNonce[thr_id], (1 + YS_SLOTS) * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+	const uint32_t count = d_gnounce[thr_id][0];
+	// more than YS_SLOTS candidates in one batch (only under a loosened target):
+	// the extra ones are dropped here, the host resumes at the highest reported
+	uint32_t stored = min(count, (uint32_t) YS_SLOTS);
+	if (stored > max_results) stored = max_results;
+	for (uint32_t i = 0; i < stored; i++)
+		resultnonces[i] = d_gnounce[thr_id][1 + i];
+	return stored;
 }
 
 __host__ void yescrypt_cpu_free(int thr_id)

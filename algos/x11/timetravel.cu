@@ -118,10 +118,18 @@ static void getAlgoString(char *str, int seq)
 	*sptr = '\0';
 }
 
+/* The scan's order is per miner thread: at a job change every thread keeps
+ * hashing (and CPU-checking) its own job with that job's order until it sees
+ * work_restart. A process-global order let the first thread on the new job
+ * rewrite it under the others. */
 static __thread uint32_t s_ntime = 0;
-static uint32_t s_sequence = UINT32_MAX;
-static uint8_t s_firstalgo = 0xFF;
-static char hashOrder[HASH_FUNC_COUNT + 1] = { 0 };
+static __thread uint32_t s_sequence = UINT32_MAX;
+static __thread uint8_t s_firstalgo = 0xFF;
+static __thread char hashOrder[HASH_FUNC_COUNT + 1] = { 0 };
+
+/* the CPU hash derives its own order from its input's ntime (cached per thread) */
+static __thread uint32_t s_cpu_sequence = UINT32_MAX;
+static __thread char s_cpu_order[HASH_FUNC_COUNT + 1] = { 0 };
 
 #define INITIAL_DATE HASH_FUNC_BASE_TIMESTAMP
 static inline uint32_t getCurrentAlgoSeq(uint32_t ntime)
@@ -154,11 +162,16 @@ extern "C" void timetravel_hash(void *output, const void *input)
 	sph_luffa512_context     ctx_luffa1;
 	sph_cubehash512_context  ctx_cubehash1;
 
-	if (s_sequence == UINT32_MAX) {
-		uint32_t *data = (uint32_t*) input;
-		const uint32_t ntime = (opt_benchmark || !data[17]) ? (uint32_t) time(NULL) : data[17];
-		get_travel_order(ntime, hashOrder);
+	/* The order is a function of the header being hashed: word 17 of the
+	 * byte-swapped header is the ntime the scan uses (swab32(pdata[17])). */
+	{
+		const uint32_t seq = getCurrentAlgoSeq(((const uint32_t*) input)[17]);
+		if (seq != s_cpu_sequence) {
+			getAlgoString(s_cpu_order, seq);
+			s_cpu_sequence = seq;
+		}
 	}
+	const char *hashOrder = s_cpu_order;
 
 	void *in = (void*) input;
 	int size = 80;
@@ -310,7 +323,7 @@ extern "C" int scanhash_timetravel(int thr_id, struct work* work, uint32_t max_n
 	const uint8_t algo80 = first >= 'A' ? first - 'A' + 10 : first - '0';
 	if (algo80 != s_firstalgo) {
 		s_firstalgo = algo80;
-		applog(LOG_INFO, "Timetravel first algo is now %s", algo_strings[algo80 % HASH_FUNC_COUNT]);
+		if (!thr_id) applog(LOG_INFO, "Timetravel first algo is now %s", algo_strings[algo80 % HASH_FUNC_COUNT]);
 	}
 
 	/* (re)build the per-permutation fused-run structure + upload the mapped

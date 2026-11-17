@@ -117,6 +117,10 @@ static bool verthash_selftest_run(int thr_id, uint32_t N, int *mism, bool *negat
 	*negative_ok = false;
 
 	for (int i = 0; i < 80; i++) header[i] = (uint8_t)(i * 7 + 1);
+	// Byte 0 near the top of its range: the 8 subset seeds byte0+1..byte0+8 then
+	// cover both the plain lanes (0xfb..0xff) and the wrap lanes (0x00..0x02),
+	// so a seed add that carries into byte 1 fails the test.
+	header[0] = 0xfa;
 
 	if (fault && !strcmp(fault, "cuda")) return selftest_cuda_fault();
 
@@ -173,6 +177,12 @@ static bool verthash_selftest(int thr_id)
 		       mism, N, (int) negative_ok, (int) ran);
 
 	return selftest_gate(thr_id, "verthash", passed);
+}
+
+static int verthash_cmp_u32(const void *a, const void *b)
+{
+	const uint32_t x = *(const uint32_t *) a, y = *(const uint32_t *) b;
+	return (x > y) - (x < y);
 }
 
 extern "C" int scanhash_verthash(int thr_id, struct work *work, uint32_t max_nonce, unsigned long *hashes_done)
@@ -276,9 +286,17 @@ extern "C" int scanhash_verthash(int thr_id, struct work *work, uint32_t max_non
 	const uint32_t Htarg = ptarget[7];
 
 	do {
-		const uint32_t batch = intensity_tuner_running(&s_tuner[thr_id])
+		if (pdata[19] >= max_nonce)
+			break;
+		const uint32_t tuned = intensity_tuner_running(&s_tuner[thr_id])
 		                     ? intensity_tuner_size(&s_tuner[thr_id])
 		                     : intensity_tuner_chosen(&s_tuner[thr_id]);
+		// n = real nonces of this launch, clamped to the end of the range. The
+		// launch itself stays a multiple of 256 (exact grids, no bounds guard in the
+		// IO kernel); tuned is one, so batch <= tuned <= the allocated maximum.
+		// Candidates at offset >= n (past max_nonce) are dropped below.
+		const uint32_t n = (uint32_t) min((uint64_t) tuned, (uint64_t) max_nonce - pdata[19]);
+		const uint32_t batch = (n + 255u) & ~255u;
 		const double t_batch = tuner_now();
 
 		cudaMemset(d_results[thr_id], 0, sizeof(uint32_t));
@@ -291,16 +309,22 @@ extern "C" int scanhash_verthash(int thr_id, struct work *work, uint32_t max_non
 		cudaMemcpy(&nres, d_results[thr_id], sizeof(uint32_t), cudaMemcpyDeviceToHost);
 		if (nres > batch) nres = batch;
 
-		// A batch that found something pays a host re-verify, so it is not a fair
-		// sample of launch size; feed it in tainted.
-		intensity_tuner_sample(&s_tuner[thr_id], tuner_now() - t_batch, nres != 0);
+		// A batch that found something pays a host re-verify, and a clamped last
+		// batch is not the tuned size, so neither is a fair sample; feed them tainted.
+		intensity_tuner_sample(&s_tuner[thr_id], tuner_now() - t_batch, nres != 0 || batch != tuned);
 
 		if (nres && bench_algo < 0) {
 			uint32_t *offs = (uint32_t *) malloc((size_t) nres * sizeof(uint32_t));
 			cudaMemcpy(offs, d_results[thr_id] + 1, (size_t) nres * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+			// slots are in atomicAdd order: check in nonce order, so the two
+			// reported are the lowest valid ones and every later candidate lies
+			// above the resume point (the next scan finds it again)
+			qsort(offs, nres, sizeof(uint32_t), verthash_cmp_u32);
 
 			work->valid_nonces = 0;
 			for (uint32_t r = 0; r < nres && work->valid_nonces < 2; r++) {
+				if (offs[r] >= n)
+					break;   // padding of a clamped launch: past max_nonce
 				const uint32_t nonce = pdata[19] + offs[r];
 				uint32_t _ALIGN(64) vhash[8];
 				((uint32_t *) endiandata)[19] = nonce;   // raw nonce (verthash hashes it LE)
@@ -309,30 +333,30 @@ extern "C" int scanhash_verthash(int thr_id, struct work *work, uint32_t max_non
 					work->nonces[work->valid_nonces] = nonce;
 					bn_set_target_ratio(work, vhash, work->valid_nonces);
 					work->valid_nonces++;
-				} else {
-					// Legitimate: the screen is a safe superset, so only the
-					// word7 == target case reaches here. Logged so a wrong
-					// kernel cannot be silent.
+				} else if (vhash[7] > Htarg) {
+					// the screen is a safe superset (word 7 <= target), so a word-7
+					// miss here is a wrong GPU hash: count it, never stay silent
+					gpu_increment_reject(thr_id);
 					gpulog(LOG_WARNING, thr_id, "result for %08x does not validate on CPU!", nonce);
 				}
+				// word 7 == target but the lower words fail: a legitimate screen pass
 			}
 			free(offs);
 
 			if (work->valid_nonces) {
-				pdata[19] += batch;
-				if (pdata[19] > max_nonce) pdata[19] = max_nonce;
-				*hashes_done = pdata[19] - first_nonce;
+				*hashes_done = pdata[19] - first_nonce + n;
+				// resume at the highest reported nonce; the core steps past it
+				// (nonceptr[0]++ on the same work), candidates above it are re-found
+				pdata[19] = work->nonces[work->valid_nonces - 1];
 				return work->valid_nonces;
 			}
-			// all candidates were GPU false-positives (top word == target,
-			// lower words failed) -- keep scanning.
 		}
 
-		if ((uint64_t) batch + pdata[19] >= max_nonce) {
+		if ((uint64_t) n + pdata[19] >= max_nonce) {
 			pdata[19] = max_nonce;
 			break;
 		}
-		pdata[19] += batch;
+		pdata[19] += n;
 
 	} while (!work_restart[thr_id].restart);
 

@@ -11,8 +11,11 @@ extern "C" {
 
 extern void yescrypt_cpu_init(int thr_id, int threads, uint32_t *d_hash1, uint32_t *d_hash2, uint32_t *d_hash3, uint32_t *d_hash4);
 extern void yescrypt_setTarget(int thr_id, uint32_t pdata[20], char *key, uint32_t key_len);
-extern void yescrypt_cpu_hash_32(int thr_id, uint32_t threads, uint32_t startNounce, uint32_t *resultnonces, uint32_t target, const uint32_t N, const uint32_t r, const uint32_t p);
+extern uint32_t yescrypt_cpu_hash_32(int thr_id, uint32_t threads, uint32_t valid, uint32_t startNounce, uint32_t *resultnonces, uint32_t max_results, uint32_t target, const uint32_t N, const uint32_t r, const uint32_t p);
 extern void yescrypt_cpu_free(int thr_id);
+
+/* candidates the launcher hands back per batch (it keeps a counted slot array) */
+#define YS_HOST_SLOTS 8
 
 extern char *yescrypt_key;
 extern size_t yescrypt_key_len;
@@ -103,22 +106,11 @@ int scanhash_yescrypt_base(int thr_id, struct work* work, uint32_t max_nonce, un
 	throughputmax = (throughputmax / CUDAcore_count) * CUDAcore_count;
 	if (throughputmax == 0) throughputmax = CUDAcore_count;
 
-	uint32_t throughput = min(throughputmax, max_nonce - first_nonce);
-
-	// yescrypt_cpu_hash_32 requires a multiple of 32: it tiles the batch three ways
-	// at once -- grid = threads/32, the 4-way k1 split by threads>>2 and the 16-way
-	// SMix split by threads>>4 -- and only a multiple of 32 makes all three cover
-	// exactly `threads` nonces. throughputmax already is one; max_nonce-first_nonce
-	// need not be, so clamp here, where hashes_done is derived from the same value.
-	throughput &= ~31u;
-	if (throughput == 0) {
-		// Fewer than 32 nonces left in this work unit: nothing scannable. Advance
-		// pdata[19] so the caller sees the stub range consumed -- returning 0 with
-		// hashes_done = 0 and an unchanged nonce would spin.
-		pdata[19] = max_nonce;
-		*hashes_done = 0;
-		return 0;
-	}
+	// The launcher tiles a batch three ways (grid = threads/32, k1's 4-way and
+	// SMix's 16-way splits) and needs a multiple of 32; every launch below is
+	// padded up to one, so the allocation must be one too (CUDAcore_count is).
+	throughputmax &= ~31u;
+	if (throughputmax == 0) throughputmax = 32;
 
 	if (opt_benchmark)
 		((uint32_t*)ptarget)[7] = 0x00ff;
@@ -159,7 +151,7 @@ int scanhash_yescrypt_base(int thr_id, struct work* work, uint32_t max_nonce, un
 
 		yescrypt_cpu_init(thr_id, throughputmax, d_hash1, d_hash2, d_hash3, d_hash4);
 
-		cuda_check_cpu_init(thr_id, throughput);
+		cuda_check_cpu_init(thr_id, throughputmax);
 //		mining_has_stopped[thr_id] = false;
 
 		init = true;
@@ -170,67 +162,64 @@ int scanhash_yescrypt_base(int thr_id, struct work* work, uint32_t max_nonce, un
 		be32enc(&endiandata[k], pdata[k]);
 
 	yescrypt_setTarget(thr_id, pdata, key, key_len);
+	const uint32_t Htarg = ptarget[7];
 	do {
-		uint32_t foundNonce[2] = { 0, 0 };
+		if (pdata[19] >= max_nonce)
+			break;
+		// n = real nonces of this launch, clamped to the end of the range. The
+		// launch is padded to a multiple of 32 (<= throughputmax, both are); the
+		// result kernel only reports lanes below n, so padding cannot report.
+		const uint32_t n = (uint32_t) min((uint64_t) throughputmax, (uint64_t) max_nonce - pdata[19]);
+		const uint32_t launch = (n + 31u) & ~31u;
 
-		yescrypt_cpu_hash_32(thr_id, throughput, pdata[19], foundNonce, ptarget[7], N, r, p);
+		uint32_t found[YS_HOST_SLOTS];
+		const uint32_t nfound = yescrypt_cpu_hash_32(thr_id, launch, n, pdata[19], found, YS_HOST_SLOTS,
+		                                             Htarg, N, r, p);
 
-//		if (stop_mining)
-//		{
-//			mining_has_stopped[thr_id] = true; cudaStreamDestroy(gpustream[thr_id]); pthread_exit(nullptr);
-//		}
-
-		*hashes_done = pdata[19] - first_nonce + throughput;
-
-		if (foundNonce[0] != 0 && foundNonce[0] < max_nonce)
-		{
-			const uint32_t Htarg = ptarget[7];
-			uint32_t _ALIGN(64) vhash64[8] = { 0 };
-//			if (opt_verify)
-			{
-				be32enc(&endiandata[19], foundNonce[0]);
-				yescrypt_hash_base(vhash64, endiandata, N, r, p, key, key_len);
-			}
-			if (vhash64[7] <= Htarg && fulltest(vhash64, ptarget)) {
-				int res = 1;
-				work->nonces[0] = foundNonce[0];
-				work->valid_nonces++;
-				// check if there was some other ones...
-				*hashes_done = pdata[19] - first_nonce + throughput;
-				if (foundNonce[1] != 0 && foundNonce[1] < max_nonce) {
-//					if (opt_verify)
-					{
-						be32enc(&endiandata[19], foundNonce[1]);
-						yescrypt_hash_base(vhash64, endiandata, N, r, p, key, key_len);
-					}
-					if (vhash64[7] <= Htarg && fulltest(vhash64, ptarget))
-					{
-						pdata[21] = foundNonce[1];
-						res++;
-						work->nonces[1] = foundNonce[1];
-						work->valid_nonces++;
-						if (opt_benchmark)  applog(LOG_INFO, "GPU #%d Found second nonce %08x", thr_id, foundNonce[1]);
-					}
-					else
-					{
-						if (vhash64[7] != Htarg) // don't show message if it is equal but fails fulltest
-							applog(LOG_WARNING, "GPU #%d: result does not validate on CPU!", dev_id);
-					}
+		if (nfound) {
+			// slots are in atomicAdd order: check in nonce order, so the two
+			// reported are the lowest valid ones and every later candidate lies
+			// above the resume point (the next scan finds it again)
+			for (uint32_t i = 1; i < nfound; i++)
+				for (uint32_t j = i; j > 0 && found[j - 1] > found[j]; j--) {
+					const uint32_t t = found[j]; found[j] = found[j - 1]; found[j - 1] = t;
 				}
-				pdata[19] = foundNonce[0];
-				if (opt_benchmark)  applog(LOG_INFO, "GPU #%d Found nonce % 08x", thr_id, foundNonce[0]);
-				return res;
+
+			work->valid_nonces = 0;
+			for (uint32_t i = 0; i < nfound && work->valid_nonces < 2; i++) {
+				uint32_t _ALIGN(64) vhash64[8] = { 0 };
+				be32enc(&endiandata[19], found[i]);
+				yescrypt_hash_base(vhash64, endiandata, N, r, p, key, key_len);
+				if (vhash64[7] <= Htarg && fulltest(vhash64, ptarget)) {
+					work->nonces[work->valid_nonces] = found[i];
+					bn_set_target_ratio(work, vhash64, work->valid_nonces);
+					work->valid_nonces++;
+					if (opt_benchmark)
+						gpulog(LOG_INFO, thr_id, "found nonce %08x", found[i]);
+				} else if (vhash64[7] > Htarg) {
+					// the screen compares word 7 only, so a word-7 miss is a
+					// wrong GPU hash (equal word 7 failing fulltest is legitimate)
+					gpu_increment_reject(thr_id);
+					gpulog(LOG_WARNING, thr_id, "result for %08x does not validate on CPU!", found[i]);
+				}
 			}
-			else
-			{
-				if (vhash64[7] != Htarg) // don't show message if it is equal but fails fulltest
-					applog(LOG_WARNING, "GPU #%d: result does not validate on CPU!", dev_id);
+
+			if (work->valid_nonces) {
+				*hashes_done = pdata[19] - first_nonce + n;
+				// resume at the highest reported nonce; the core steps past it
+				// (nonceptr[0]++ on the same work)
+				pdata[19] = work->nonces[work->valid_nonces - 1];
+				return work->valid_nonces;
 			}
 		}
 
-		pdata[19] += throughput;
+		if ((uint64_t) n + pdata[19] >= max_nonce) {
+			pdata[19] = max_nonce;
+			break;
+		}
+		pdata[19] += n;
 
-	} while (!work_restart[thr_id].restart && ((uint64_t)max_nonce > ((uint64_t)(pdata[19]) + (uint64_t)throughput)));
+	} while (!work_restart[thr_id].restart);
 
 	*hashes_done = pdata[19] - first_nonce;
 	return 0;

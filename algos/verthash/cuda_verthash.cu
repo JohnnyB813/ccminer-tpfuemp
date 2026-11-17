@@ -66,7 +66,10 @@ __global__ void verthash_gpu_precompute(uint2 *kstates)
 	#pragma unroll
 	for (int i = 0; i < 25; i++) st[i] = make_uint2(0, 0);
 
-	st[0].x = c_vh_header[0] + (t & 7) + 1; st[0].y = c_vh_header[1];
+	// The reference increments header BYTE 0 (wrapping within the byte); a word
+	// add would carry into byte 1 when byte 0 >= 0xf8.
+	const uint32_t h0 = c_vh_header[0];
+	st[0].x = (h0 & 0xffffff00u) | ((h0 + (t & 7) + 1) & 0xffu); st[0].y = c_vh_header[1];
 	st[1].x = c_vh_header[2];  st[1].y = c_vh_header[3];
 	st[2].x = c_vh_header[4];  st[2].y = c_vh_header[5];
 	st[3].x = c_vh_header[6];  st[3].y = c_vh_header[7];
