@@ -1,8 +1,8 @@
 /*
  * HoohashV110 (PEPEPOW) - CUDA device kernels + launchers.
  *
- * The 64x64 matrix depends only on the nonce-zeroed header, so it is generated once
- * per scan call (hoohash_gen_matrix) and read warp-uniformly by the mining kernel.
+ * The 64x64 matrix and its matdiv*v table depend only on the nonce-zeroed header, so
+ * they are generated once per scan call (hoohash_gen_matrix).
  *
  * MUST be compiled with strict FP (no --use_fast_math; --fmad=false --prec-div=true
  * --prec-sqrt=true --ftz=false) - see the per-file build settings.
@@ -55,17 +55,27 @@ static void hoohash_gen_all(void)
 }
 
 // Run a transform phase once this many lanes wait (or none can step); tuned per arch.
+// sm_6x also trades registers for occupancy; sm_75+ must stay without bounds.
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
-#define HOO_WAIT_K 14
+#define HOO_WAIT_K 20
+#define HOOHASH_GPU_HASH_BOUNDS __launch_bounds__(128, 10)
 #else
 #define HOO_WAIT_K 24
+#define HOOHASH_GPU_HASH_BOUNDS
 #endif
+
+// Nibble j of firstPass (high nibble first), from four big-endian words held in registers.
+static __device__ __forceinline__ uint8_t hoo_nibble(const uint64_t w[4], int j)
+{
+	const uint64_t x = j < 16 ? w[0] : j < 32 ? w[1] : j < 48 ? w[2] : w[3];
+	return (uint8_t)((x >> (60 - 4 * (j & 15))) & 0xF);
+}
 
 // Per-nonce: firstPass = BLAKE3(full header), then the 64x64 scan. Each lane walks its own
 // (i, j) in reference order; lanes needing the transform wait and are evaluated together.
 // Digest stored BYTE-REVERSED so cuda_check_hash / fulltest (word7 = MSB) compare the
 // big-endian digest correctly. cuda_checkhash_64 strides 64-byte (16-word) slots.
-__global__ void hoohash_gpu_hash(uint32_t threads, uint32_t startNonce, uint32_t* outputHash)
+__global__ void HOOHASH_GPU_HASH_BOUNDS hoohash_gpu_hash(uint32_t threads, uint32_t startNonce, uint32_t* outputHash)
 {
 	const unsigned lanes = __activemask();
 	const uint32_t thread = blockDim.x * blockIdx.x + threadIdx.x;
@@ -91,8 +101,12 @@ __global__ void hoohash_gpu_hash(uint32_t threads, uint32_t startNonce, uint32_t
 	const double nonceMod = (double)(hoo_read_u32le(header + 76) & 0xFF);
 	const double multiplier = 1234;
 
-	uint8_t vec[64];
-	for (int k = 0; k < 32; k++) { vec[2 * k] = firstPass[k] >> 4; vec[2 * k + 1] = firstPass[k] & 0x0F; }
+	uint64_t nw[4];
+	for (int k = 0; k < 4; k++) {
+		uint64_t w = 0;
+		for (int b = 0; b < 8; b++) w = (w << 8) | firstPass[8 * k + b];
+		nw[k] = w;
+	}
 
 	uint8_t scaled[32];
 	int i = live ? 0 : 64, j = 0;
@@ -102,7 +116,7 @@ __global__ void hoohash_gpu_hash(uint32_t threads, uint32_t startNonce, uint32_t
 
 	for (;;) {
 		const bool done = (i >= 64);
-		const uint8_t v = done ? 0 : vec[j];
+		const uint8_t v = done ? 0 : hoo_nibble(nw, j);
 		const bool needT = !done && v != 0 && low;   // v == 0 adds exactly +0.0 on either branch
 		const unsigned mT = __ballot_sync(lanes, needT);
 		const unsigned mC = __ballot_sync(lanes, !done && !needT);

@@ -25,4 +25,5 @@ code is compiled per `sm_*`.
 
 The mining kernel lets each lane walk its own position in the 64x64 scan and evaluates
 the expensive transform for all waiting lanes together (`HOO_WAIT_K`, tuned per arch);
-results are bit-identical to the reference.
+results are bit-identical to the reference. On sm_6x it also carries `__launch_bounds__`
+(fewer registers, more resident warps); sm_75 and newer are compiled without bounds.
