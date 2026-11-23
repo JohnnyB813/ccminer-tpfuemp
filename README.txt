@@ -1,5 +1,5 @@
 
-ccminer-tpfuemp 2026.11   "Pearlhash; equihash 144/5 and 192/7 up to 3x; faster bc3hash and curvehash"
+ccminer-tpfuemp 2026.11.1   "Hoohash up to 2.9x; equihash 144/5 and 192/7 +16-38%; share-handling fixes"
 ---------------------------------------------------------------
 
 Donation addresses and contributor credits are in CREDITS.txt.
@@ -330,6 +330,34 @@ Toolkit, use the upstream project instead -- it retains that wider hardware and
 toolkit range: https://github.com/tpruvot/ccminer
 
 >>> RELEASE HISTORY <<<
+  Nov. 23rd 2026 ccminer-tpfuemp 2026.11.1
+
+                  Speed
+                    hoohash    RTX 3060 ~464 -> ~1350 kH/s, GTX 1080 Ti
+                               ~1130 -> ~2760 kH/s
+                    equihash   144/5: GTX 1080 Ti 61 -> 81, RTX 3060 39 -> 54
+                               Sol/s; 192/7: 37 -> 43 and 25 -> 30 Sol/s
+
+                  Fixes
+                    hoohash    every share is re-checked on the CPU with the
+                               node's reference code before submit
+                    equihash   144/5 and 192/7: on multi-GPU rigs every solver
+                               ran on GPU 0; shares lost after a pause, an
+                               algo switch or a pool personalization change
+                    rinhash    multi-GPU rigs shared one GPU buffer; a second
+                               valid nonce in a launch was lost
+                    bc3hash    duplicate share submits ("already sent")
+                    verthash   every hash of a job was wrong when the header
+                               version's low byte was 0xf8 or higher
+                    yescrypt   variants: up to 31 nonces at the end of a range
+                               were lost
+                    timetravel wrong hash order for a GPU still on the old job
+                               (multi-GPU)
+                    x16r, x16rt, x16rv2, x16s, x17, hmq1725, skydoge, x21s,
+                    soterg, whirlpoolx2, anime, heavyhash: a candidate that
+                    failed the CPU check skipped the rest of the launch, and
+                    half of these faults were not logged
+
   Nov. 13th 2026 ccminer-tpfuemp 2026.11
 
                   New algorithms
