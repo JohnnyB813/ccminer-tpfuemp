@@ -125,8 +125,7 @@ __global__ void rin_coop_initialize(struct block *memory, uint32_t start_nonce)
  * blake2b_compress_4w() requires. */
 __global__ void rin_coop_finalize(struct block *memory, uint32_t start_nonce,
                                   uint32_t span,
-                                  uint32_t *solution_found, uint32_t *solution_nonce,
-                                  uint32_t *solution_hash)
+                                  uint32_t *solution_found, uint32_t *solution_nonce)
 {
 	extern __shared__ uint32_t s_buf[];
 	uint32_t *input = &s_buf[threadIdx.y * 258];
@@ -192,9 +191,15 @@ __global__ void rin_coop_finalize(struct block *memory, uint32_t start_nonce,
 		if (hash_words[i] < c_rin_target[i]) break;
 	}
 
-	if (meets && atomicCAS(solution_found, 0, 1) == 0) {
-		*solution_nonce = nonce;
-		for (int w = 0; w < 8; w++) solution_hash[w] = hash_words[w];
+	/* Report the LOWEST candidate of the launch (the slot is preset to
+	 * 0xFFFFFFFF): the host resumes at reported + 1, so every other candidate
+	 * is above it and found again. A first-come slot would lose the ones below.
+	 * The digest goes to this nonce's own lane (its block 0 was read above and
+	 * the next launch re-initializes it); the host fetches the reported one. */
+	if (meets) {
+		for (int w = 0; w < 8; w++) mem_lane[w] = hash_words[w];
+		atomicMin(solution_nonce, nonce);
+		atomicExch(solution_found, 1u);
 	}
 }
 
@@ -205,8 +210,7 @@ static struct {
 	struct block *d_memory;
 	uint32_t *d_solution_found;
 	uint32_t *d_solution_nonce;
-	uint32_t *d_solution_hash;
-	uint32_t *h_pinned;              /* found | nonce, 2 words */
+	uint32_t *h_pinned;              /* found | nonce | hash[8] */
 	uint32_t  max_nonces;
 	cudaStream_t stream;
 	bool init;
@@ -235,10 +239,9 @@ extern "C" void rinhash_coop_reserve(int thr_id, uint32_t max_nonces)
 
 	const size_t bytes = (size_t)max_nonces * RIN_TOTAL_BLOCKS * ARGON2_BLOCK_SIZE;
 	cudaMalloc(&g_coop[thr_id].d_memory, bytes);
-	/* one allocation for the three small outputs: found | nonce | hash[8] */
-	cudaMalloc(&g_coop[thr_id].d_solution_found, 10 * sizeof(uint32_t));
+	/* one allocation for the two report words: found | nonce */
+	cudaMalloc(&g_coop[thr_id].d_solution_found, 2 * sizeof(uint32_t));
 	g_coop[thr_id].d_solution_nonce = g_coop[thr_id].d_solution_found + 1;
-	g_coop[thr_id].d_solution_hash  = g_coop[thr_id].d_solution_found + 2;
 	cudaMallocHost(&g_coop[thr_id].h_pinned, 10 * sizeof(uint32_t));
 	g_coop[thr_id].max_nonces = max_nonces;
 	g_coop[thr_id].init = true;
@@ -292,10 +295,8 @@ extern "C" void RinHash_mine_coop(int thr_id,
 	cudaMemcpyToSymbolAsync(c_rin_header, work_data, 80, 0, cudaMemcpyHostToDevice, st);
 	cudaMemcpyToSymbolAsync(c_rin_target, target, 8 * sizeof(uint32_t), 0,
 	                        cudaMemcpyHostToDevice, st);
-	/* Arm all ten words, not just the two the kernel always writes: the
-	 * readback below copies the digest too, and nothing writes it on the
-	 * no-solution path. */
-	cudaMemsetAsync(g_coop[thr_id].d_solution_found, 0, 10 * sizeof(uint32_t), st);
+	/* found = 0; nonce = 0xFFFFFFFF, the atomicMin identity */
+	cudaMemsetAsync(g_coop[thr_id].d_solution_found, 0, sizeof(uint32_t), st);
 	cudaMemsetAsync(g_coop[thr_id].d_solution_nonce, 0xFF, sizeof(uint32_t), st);
 
 	const uint32_t jobs = launched / RIN_JOBS_PER_BLOCK;
@@ -311,19 +312,29 @@ extern "C" void RinHash_mine_coop(int thr_id,
 	rin_coop_finalize<<<jobs, dim3(4, RIN_JOBS_PER_BLOCK),
 	                    RIN_JOBS_PER_BLOCK * 258 * sizeof(uint32_t), st>>>(
 	        (struct block *)g_coop[thr_id].d_memory, start_nonce, num_nonces,
-	        g_coop[thr_id].d_solution_found, g_coop[thr_id].d_solution_nonce, g_coop[thr_id].d_solution_hash);
+	        g_coop[thr_id].d_solution_found, g_coop[thr_id].d_solution_nonce);
 
 	cudaMemcpyAsync(g_coop[thr_id].h_pinned, g_coop[thr_id].d_solution_found,
-	                10 * sizeof(uint32_t), cudaMemcpyDeviceToHost, st);
+	                2 * sizeof(uint32_t), cudaMemcpyDeviceToHost, st);
 	cudaStreamSynchronize(st);
 	coop_check("launch");
 
-	*solution_found = g_coop[thr_id].h_pinned[0];
+	/* Only reported nonces in [start, start+num_nonces) can be set (the
+	 * kernel guards the padded tail); check anyway before indexing a lane. */
+	*solution_found = g_coop[thr_id].h_pinned[0] &&
+	                  g_coop[thr_id].h_pinned[1] - start_nonce < num_nonces;
 	/* Nothing is abandoned -- no wave loop -- so this is exactly the span. */
 	*hashes_actually_done = num_nonces;
 
 	if (*solution_found) {
 		*found_nonce = g_coop[thr_id].h_pinned[1];
+		/* the reported nonce's digest, left in block 0 of its own lane */
+		const size_t lane = (size_t)(*found_nonce - start_nonce) * RIN_TOTAL_BLOCKS;
+		cudaMemcpyAsync(g_coop[thr_id].h_pinned + 2,
+		                (const uint32_t *)(g_coop[thr_id].d_memory + lane),
+		                8 * sizeof(uint32_t), cudaMemcpyDeviceToHost, st);
+		cudaStreamSynchronize(st);
+		coop_check("digest");
 		for (int i = 0; i < 8; i++)
 			((uint32_t *)best_hash)[i] = g_coop[thr_id].h_pinned[2 + i];
 	} else {

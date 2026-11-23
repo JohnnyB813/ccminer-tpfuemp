@@ -148,8 +148,8 @@ int scanhash_rinhash(int thr_id, struct work *work, uint32_t max_nonce, unsigned
                 work->valid_nonces = 1;
                 work_set_target_ratio(work, vhash);
                 work->nonces[0] = found_nonce;
-                // one report slot per launch: resume after the find, not past the
-                // chunk, or a second valid nonce in it is lost (a chunk is ~7 ms)
+                // the launch reports its LOWEST candidate: resume after it, not
+                // past the chunk, so the others are found again (a chunk is ~7 ms)
                 pdata[19] = found_nonce + 1;
                 *hashes_done = total_hashed;
                 return 1;
@@ -209,12 +209,11 @@ static bool rinhash_device_selftest(int thr_id)
     b3_ok = (strcmp(got, KAT_BLAKE3_EMPTY) == 0);
 
     // An all-ones target makes every nonce in the span a candidate, so the
-    // launcher answers immediately for a span of our choosing. It does NOT make
-    // a particular nonce win: the cooperative path finalizes 16 nonces per
-    // block concurrently and the single report slot goes to whichever thread
-    // reaches the atomicCAS first. So each leg checks the reported nonce is
-    // inside the span and then holds the device to the reference for THAT
-    // nonce -- never for the nonce we happened to ask about.
+    // launcher answers immediately for a span of our choosing. The launch
+    // reports its lowest candidate, which here must be the first nonce of the
+    // span (the kat leg checks that, so the ordering itself is tested); the
+    // digest is then held to the reference for the reported nonce. The neg leg
+    // only requires a nonce inside the span.
     const uint32_t kat_span = 128;
     uint32_t target[8];
     for (int i = 0; i < 8; i++) target[i] = 0xFFFFFFFFu;
@@ -237,6 +236,10 @@ static bool rinhash_device_selftest(int thr_id)
         // a real failure, not a resource fault.
         gpulog(LOG_ERR, thr_id, "RinHash self-test: reported nonce %08x outside [%08x,%08x)",
                found, kat_nonce, kat_nonce + kat_span);
+    } else if (found != kat_nonce) {
+        // every nonce is a candidate, so the lowest one must be reported
+        gpulog(LOG_ERR, thr_id, "RinHash self-test: reported %08x, not the lowest candidate %08x",
+               found, kat_nonce);
     } else {
         uint32_t kat_hdr[20];
         memcpy(kat_hdr, hdr, 80);
