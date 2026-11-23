@@ -210,7 +210,7 @@ static struct {
 	uint32_t  max_nonces;
 	cudaStream_t stream;
 	bool init;
-} g_coop = { 0 };
+} g_coop[MAX_GPUS];   /* per GPU thread: each lives on its own device */
 
 static void coop_check(const char *where)
 {
@@ -219,29 +219,29 @@ static void coop_check(const char *where)
 		applog(LOG_ERR, "rinhash coop: %s: %s", where, cudaGetErrorString(e));
 }
 
-extern "C" void rinhash_coop_reserve(uint32_t max_nonces)
+extern "C" void rinhash_coop_reserve(int thr_id, uint32_t max_nonces)
 {
 	max_nonces = (max_nonces / RIN_JOBS_PER_BLOCK) * RIN_JOBS_PER_BLOCK;
 	if (max_nonces == 0) max_nonces = RIN_JOBS_PER_BLOCK;
-	if (g_coop.init && max_nonces <= g_coop.max_nonces) return;
+	if (g_coop[thr_id].init && max_nonces <= g_coop[thr_id].max_nonces) return;
 
-	if (g_coop.init) {
-		cudaFree(g_coop.d_memory);
-		cudaFree(g_coop.d_solution_found);
-		cudaFreeHost(g_coop.h_pinned);
+	if (g_coop[thr_id].init) {
+		cudaFree(g_coop[thr_id].d_memory);
+		cudaFree(g_coop[thr_id].d_solution_found);
+		cudaFreeHost(g_coop[thr_id].h_pinned);
 	} else {
-		cudaStreamCreate(&g_coop.stream);
+		cudaStreamCreate(&g_coop[thr_id].stream);
 	}
 
 	const size_t bytes = (size_t)max_nonces * RIN_TOTAL_BLOCKS * ARGON2_BLOCK_SIZE;
-	cudaMalloc(&g_coop.d_memory, bytes);
+	cudaMalloc(&g_coop[thr_id].d_memory, bytes);
 	/* one allocation for the three small outputs: found | nonce | hash[8] */
-	cudaMalloc(&g_coop.d_solution_found, 10 * sizeof(uint32_t));
-	g_coop.d_solution_nonce = g_coop.d_solution_found + 1;
-	g_coop.d_solution_hash  = g_coop.d_solution_found + 2;
-	cudaMallocHost(&g_coop.h_pinned, 10 * sizeof(uint32_t));
-	g_coop.max_nonces = max_nonces;
-	g_coop.init = true;
+	cudaMalloc(&g_coop[thr_id].d_solution_found, 10 * sizeof(uint32_t));
+	g_coop[thr_id].d_solution_nonce = g_coop[thr_id].d_solution_found + 1;
+	g_coop[thr_id].d_solution_hash  = g_coop[thr_id].d_solution_found + 2;
+	cudaMallocHost(&g_coop[thr_id].h_pinned, 10 * sizeof(uint32_t));
+	g_coop[thr_id].max_nonces = max_nonces;
+	g_coop[thr_id].init = true;
 	coop_check("reserve");
 	applog(LOG_INFO, "RinHash cooperative fill: %u nonces (%.2f MB VRAM)",
 	       max_nonces, bytes / (1024.0 * 1024.0));
@@ -256,19 +256,19 @@ extern "C" uint32_t rinhash_coop_batch_for_mps(int mpcount)
 	return mp * 256u;
 }
 
-extern "C" void rinhash_coop_cleanup(void)
+extern "C" void rinhash_coop_cleanup(int thr_id)
 {
-	if (!g_coop.init) return;
-	cudaFree(g_coop.d_memory);
-	cudaFree(g_coop.d_solution_found);
-	cudaFreeHost(g_coop.h_pinned);
-	cudaStreamDestroy(g_coop.stream);
-	g_coop.init = false;
-	g_coop.max_nonces = 0;
+	if (!g_coop[thr_id].init) return;
+	cudaFree(g_coop[thr_id].d_memory);
+	cudaFree(g_coop[thr_id].d_solution_found);
+	cudaFreeHost(g_coop[thr_id].h_pinned);
+	cudaStreamDestroy(g_coop[thr_id].stream);
+	g_coop[thr_id].init = false;
+	g_coop[thr_id].max_nonces = 0;
 }
 
 /* The launcher scanhash calls. */
-extern "C" void RinHash_mine_coop(
+extern "C" void RinHash_mine_coop(int thr_id,
     const uint32_t *work_data, uint32_t nonce_offset, uint32_t start_nonce,
     uint32_t num_nonces, uint32_t *target, uint32_t *found_nonce,
     uint8_t *target_hash, uint8_t *best_hash, uint32_t *solution_found,
@@ -282,50 +282,50 @@ extern "C" void RinHash_mine_coop(
 	if (num_nonces == 0) return;
 	uint32_t launched = ((num_nonces + RIN_JOBS_PER_BLOCK - 1) / RIN_JOBS_PER_BLOCK)
 	                    * RIN_JOBS_PER_BLOCK;
-	rinhash_coop_reserve(launched);
-	if (launched > g_coop.max_nonces) {
-		launched = g_coop.max_nonces;
+	rinhash_coop_reserve(thr_id, launched);
+	if (launched > g_coop[thr_id].max_nonces) {
+		launched = g_coop[thr_id].max_nonces;
 		if (num_nonces > launched) num_nonces = launched;
 	}
 
-	cudaStream_t st = g_coop.stream;
+	cudaStream_t st = g_coop[thr_id].stream;
 	cudaMemcpyToSymbolAsync(c_rin_header, work_data, 80, 0, cudaMemcpyHostToDevice, st);
 	cudaMemcpyToSymbolAsync(c_rin_target, target, 8 * sizeof(uint32_t), 0,
 	                        cudaMemcpyHostToDevice, st);
 	/* Arm all ten words, not just the two the kernel always writes: the
 	 * readback below copies the digest too, and nothing writes it on the
 	 * no-solution path. */
-	cudaMemsetAsync(g_coop.d_solution_found, 0, 10 * sizeof(uint32_t), st);
-	cudaMemsetAsync(g_coop.d_solution_nonce, 0xFF, sizeof(uint32_t), st);
+	cudaMemsetAsync(g_coop[thr_id].d_solution_found, 0, 10 * sizeof(uint32_t), st);
+	cudaMemsetAsync(g_coop[thr_id].d_solution_nonce, 0xFF, sizeof(uint32_t), st);
 
 	const uint32_t jobs = launched / RIN_JOBS_PER_BLOCK;
 
 	rin_coop_initialize<<<jobs, dim3(2 * RIN_LANES, RIN_JOBS_PER_BLOCK), 0, st>>>(
-	        (struct block *)g_coop.d_memory, start_nonce);
+	        (struct block *)g_coop[thr_id].d_memory, start_nonce);
 
 	argon2_fill<<<dim3(1, 1, launched), dim3(THREADS_PER_LANE, RIN_LANES, 1),
 	              RIN_LANES * ARGON2_SHARED_BLOCKS_PER_LANE * sizeof(block_g), st>>>(
-	        (struct block_g *)g_coop.d_memory, RIN_PASSES, RIN_LANES,
+	        (struct block_g *)g_coop[thr_id].d_memory, RIN_PASSES, RIN_LANES,
 	        RIN_SEGMENT_BLOCKS, RIN_VERSION, ARGON2_D);
 
 	rin_coop_finalize<<<jobs, dim3(4, RIN_JOBS_PER_BLOCK),
 	                    RIN_JOBS_PER_BLOCK * 258 * sizeof(uint32_t), st>>>(
-	        (struct block *)g_coop.d_memory, start_nonce, num_nonces,
-	        g_coop.d_solution_found, g_coop.d_solution_nonce, g_coop.d_solution_hash);
+	        (struct block *)g_coop[thr_id].d_memory, start_nonce, num_nonces,
+	        g_coop[thr_id].d_solution_found, g_coop[thr_id].d_solution_nonce, g_coop[thr_id].d_solution_hash);
 
-	cudaMemcpyAsync(g_coop.h_pinned, g_coop.d_solution_found,
+	cudaMemcpyAsync(g_coop[thr_id].h_pinned, g_coop[thr_id].d_solution_found,
 	                10 * sizeof(uint32_t), cudaMemcpyDeviceToHost, st);
 	cudaStreamSynchronize(st);
 	coop_check("launch");
 
-	*solution_found = g_coop.h_pinned[0];
+	*solution_found = g_coop[thr_id].h_pinned[0];
 	/* Nothing is abandoned -- no wave loop -- so this is exactly the span. */
 	*hashes_actually_done = num_nonces;
 
 	if (*solution_found) {
-		*found_nonce = g_coop.h_pinned[1];
+		*found_nonce = g_coop[thr_id].h_pinned[1];
 		for (int i = 0; i < 8; i++)
-			((uint32_t *)best_hash)[i] = g_coop.h_pinned[2 + i];
+			((uint32_t *)best_hash)[i] = g_coop[thr_id].h_pinned[2 + i];
 	} else {
 		*found_nonce = UINT32_MAX;
 		for (int i = 0; i < 8; i++) ((uint32_t *)best_hash)[i] = 0;

@@ -431,8 +431,6 @@ extern "C" int scanhash_x21s(int thr_id, struct work* work, uint32_t max_nonce, 
 		}
 	}
 
-	int warn = 0;
-
 	do {
 		int order = 0;
 
@@ -630,18 +628,13 @@ extern "C" int scanhash_x21s(int thr_id, struct work* work, uint32_t max_nonce, 
 				//gpulog(LOG_INFO, thr_id, "hash found with %s 80 (%s)!", algo_strings[algo80], hashOrder);
 				return work->valid_nonces;
 			}
-			else if (vhash[7] > Htarg) {
-				// x11+ coins could do some random error, but not on retry
+			else {
+				// failed candidate or top-word tie: count and log it, scan on from the next nonce
 				gpu_increment_reject(thr_id);
-				if (!warn) {
-					warn++;
-					pdata[19] = work->nonces[0] + 1;
-					continue;
-				} else {
-					if (!opt_quiet)	gpulog(LOG_WARNING, thr_id, "result for %08x does not validate on CPU! %s %s",
+				if (!opt_quiet) gpulog(LOG_WARNING, thr_id, "result for %08x does not validate on CPU! %s %s",
 						work->nonces[0], algo_strings[algo80], hashOrder);
-					warn = 0;
-				}
+				pdata[19] = work->nonces[0] + 1;
+				continue;
 			}
 		}
 

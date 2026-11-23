@@ -22,13 +22,13 @@ using namespace std;
 /* The cooperative Argon2d path (algos/rinhash/rinhash_coop.cu): 32 threads per
  * nonce sharing the argon2d family's fill kernel, with the 1 KB block held in
  * registers rather than a per-thread local buffer. */
-extern "C" void RinHash_mine_coop(
+extern "C" void RinHash_mine_coop(int thr_id,
     const uint32_t* work_data, uint32_t nonce_offset, uint32_t start_nonce,
     uint32_t num_nonces, uint32_t* target, uint32_t* found_nonce,
     uint8_t* target_hash, uint8_t* best_hash, uint32_t* solution_found,
     uint32_t* hashes_actually_done);
-extern "C" void rinhash_coop_reserve(uint32_t max_nonces);
-extern "C" void rinhash_coop_cleanup(void);
+extern "C" void rinhash_coop_reserve(int thr_id, uint32_t max_nonces);
+extern "C" void rinhash_coop_cleanup(int thr_id);
 extern "C" uint32_t rinhash_coop_batch_for_mps(int mpcount);
 
 // Both defined below; scanhash uses them.
@@ -42,7 +42,7 @@ static bool rinhash_device_selftest(int thr_id);
 extern "C" void free_rinhash(int thr_id)
 {
     cudaSetDevice(device_map[thr_id]);
-    rinhash_coop_cleanup();
+    rinhash_coop_cleanup(thr_id);
 }
 
 // Main scanning function that tries different nonces to find a valid hash
@@ -71,7 +71,7 @@ int scanhash_rinhash(int thr_id, struct work *work, uint32_t max_nonce, unsigned
     // Size the persistent buffers once, for the largest LAUNCH -- not the whole
     // batch, which no launch reaches. Growing them on demand would put a ~1 GB
     // realloc inside this timed call.
-    rinhash_coop_reserve(min(total_batch_size, kernel_chunk_size));
+    rinhash_coop_reserve(thr_id, min(total_batch_size, kernel_chunk_size));
 
     // Fail-closed, once per thread, and after the reserve so its one-nonce
     // launch cannot size the buffers small and force a realloc.
@@ -110,7 +110,7 @@ int scanhash_rinhash(int thr_id, struct work *work, uint32_t max_nonce, unsigned
         }
 
         solution_found = 0;
-        RinHash_mine_coop(
+        RinHash_mine_coop(thr_id,
             pdata,
             19, // nonce offset
             nonce,
@@ -148,13 +148,17 @@ int scanhash_rinhash(int thr_id, struct work *work, uint32_t max_nonce, unsigned
                 work->valid_nonces = 1;
                 work_set_target_ratio(work, vhash);
                 work->nonces[0] = found_nonce;
-                pdata[19] = nonce + current_chunk_size;
+                // one report slot per launch: resume after the find, not past the
+                // chunk, or a second valid nonce in it is lost (a chunk is ~7 ms)
+                pdata[19] = found_nonce + 1;
                 *hashes_done = total_hashed;
                 return 1;
             } else {
                 gpu_increment_reject(thr_id);
                 if (!opt_quiet)
                     gpulog(LOG_WARNING, thr_id, "result for %08x does not validate!", found_nonce);
+                nonce = found_nonce + 1;   // scan the rest of the chunk
+                continue;
             }
         }
         
@@ -223,7 +227,7 @@ static bool rinhash_device_selftest(int thr_id)
     uint8_t gpu[32], cpu[32], dummy[32];
     uint32_t found = 0, solved = 0, hashed = 0;
 
-    RinHash_mine_coop(hdr, 19, kat_nonce, kat_span, target,
+    RinHash_mine_coop(thr_id, hdr, 19, kat_nonce, kat_span, target,
                             &found, dummy, gpu, &solved, &hashed);
     if (!solved) {
         // The device could not answer at all: not evidence of a wrong hash.
@@ -250,7 +254,7 @@ static bool rinhash_device_selftest(int thr_id)
     memcpy(hdr2, hdr, 80);
     hdr2[3] ^= 0x00000008u;
     found = solved = 0;
-    RinHash_mine_coop(hdr2, 19, kat_nonce, kat_span, target,
+    RinHash_mine_coop(thr_id, hdr2, 19, kat_nonce, kat_span, target,
                             &found, dummy, neg_gpu, &solved, &hashed);
     if (!solved) {
         selftest_cuda_fault();

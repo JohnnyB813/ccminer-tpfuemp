@@ -81,6 +81,10 @@ static void* equi24b_ctx[MAX_GPUS] = { NULL };
 // at most in the nonce words.
 static void*    equi24b_pipe[MAX_GPUS] = { NULL };
 static uint32_t eq_pend_hdr[MAX_GPUS][2][35];
+// The personalization each queued solve was launched with: the pool can switch it
+// between notifies (zpool moves equihash144 between coins), and it is not part of
+// the header, so a solve is verified with its own and the queue drops on a change.
+static char     eq_pend_pers[MAX_GPUS][2][16];
 static int      eq_pend_n[MAX_GPUS] = { 0 };
 
 // Throughput meter for the 144/5 and 192/7 path, rate-limited to one line per 5 s.
@@ -218,14 +222,19 @@ static void tromp_emit(void* ud, const uint32_t* idx, uint32_t proofsize)
 static bool eq24_launch(int thr_id, const uint32_t *hdr)
 {
 	const int n = eq_pend_n[thr_id];
+	// one snapshot for the launch and the queue: the stratum thread may change it
+	char pers[16];
+	memcpy(pers, eq_personal, sizeof(pers));
+	pers[sizeof(pers) - 1] = '\0';
 	const int rc = (eq_wk == 7)
-		? equi24b_192_launch(equi24b_ctx[thr_id], equi24b_pipe[thr_id], (const char*) hdr, eq_personal)
-		: equi24b_144_launch(equi24b_ctx[thr_id], equi24b_pipe[thr_id], (const char*) hdr, eq_personal);
+		? equi24b_192_launch(equi24b_ctx[thr_id], equi24b_pipe[thr_id], (const char*) hdr, pers)
+		: equi24b_144_launch(equi24b_ctx[thr_id], equi24b_pipe[thr_id], (const char*) hdr, pers);
 	if (rc) {
 		gpulog(LOG_WARNING, thr_id, "equi24b launch failed (%d)", rc);
 		return false;
 	}
 	memcpy(eq_pend_hdr[thr_id][n], hdr, 140);
+	memcpy(eq_pend_pers[thr_id][n], pers, sizeof(pers));
 	eq_pend_n[thr_id] = n + 1;
 	return true;
 }
@@ -294,7 +303,8 @@ static int scanhash_equihash_dig24(int thr_id, struct work *work, uint32_t max_n
 	if (eq_pend_n[thr_id]) {
 		const uint32_t *q = eq_pend_hdr[thr_id][0];
 		if (memcmp(q, endiandata, NONCE_OFT * 4) ||
-		    memcmp(q + NONCE_OFT + 2, endiandata + NONCE_OFT + 2, 140 - (NONCE_OFT + 2) * 4))
+		    memcmp(q + NONCE_OFT + 2, endiandata + NONCE_OFT + 2, 140 - (NONCE_OFT + 2) * 4) ||
+		    strncmp(eq_pend_pers[thr_id][0], eq_personal, 8))
 			eq24_reset(thr_id);
 	}
 	if (!eq_pend_n[thr_id] && !eq24_launch(thr_id, endiandata))
@@ -309,7 +319,10 @@ static int scanhash_equihash_dig24(int thr_id, struct work *work, uint32_t max_n
 			eq24_launch(thr_id, next);
 		}
 		memcpy(endiandata, eq_pend_hdr[thr_id][0], 140);
+		char pers[16];
+		memcpy(pers, eq_pend_pers[thr_id][0], sizeof(pers));
 		memcpy(eq_pend_hdr[thr_id][0], eq_pend_hdr[thr_id][1], 140);
+		memcpy(eq_pend_pers[thr_id][0], eq_pend_pers[thr_id][1], sizeof(pers));
 		eq_pend_n[thr_id]--;
 
 		tromp_ns[thr_id] = 0;
@@ -369,9 +382,9 @@ static int scanhash_equihash_dig24(int thr_id, struct work *work, uint32_t max_n
 				if (vhash[7] <= Htarg && fulltest(vhash, ptarget)) {
 					// host re-verify with the verifier of THIS variant
 					int rc = (eq_wk == 7)
-						? eq_verify_192((const char*) endiandata, eq_personal,
+						? eq_verify_192((const char*) endiandata, pers,
 						                tromp_idx[thr_id][s])
-						: eq_verify_144((const char*) endiandata, eq_personal,
+						: eq_verify_144((const char*) endiandata, pers,
 						                tromp_idx[thr_id][s]);
 					if (rc != 0) {
 						// never drop silently: the only signal of a wrong GPU hash

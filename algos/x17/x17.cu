@@ -193,8 +193,6 @@ extern "C" int scanhash_x17(int thr_id, struct work* work, uint32_t max_nonce, u
 	blake512_cpu_setBlock_80(thr_id, endiandata);
 	cuda_check_cpu_setTarget(ptarget);
 
-	int warn = 0;
-
 	do {
 		int order = 0;
 
@@ -241,18 +239,13 @@ extern "C" int scanhash_x17(int thr_id, struct work* work, uint32_t max_nonce, u
 				}
 				return work->valid_nonces;
 			}
-			else if (vhash[7] > Htarg) {
-				// x11+ coins could do some random error, but not on retry
+			else {
+				// failed candidate or top-word tie: count and log it, scan on from the next nonce
 				gpu_increment_reject(thr_id);
-				if (!warn) {
-					warn++;
-					pdata[19] = work->nonces[0] + 1;
-					continue;
-				} else {
-					if (!opt_quiet)
+				if (!opt_quiet)
 					gpulog(LOG_WARNING, thr_id, "result for %08x does not validate on CPU!", work->nonces[0]);
-					warn = 0;
-				}
+				pdata[19] = work->nonces[0] + 1;
+				continue;
 			}
 		}
 

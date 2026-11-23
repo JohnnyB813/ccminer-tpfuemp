@@ -6,12 +6,52 @@
  *             cuda_check_hash / fulltest (word 7 = MSB) work.
  *   - Difficulty: 2^16 share-target factor, set in ccminer.cpp.
  *
- * Candidates are NOT re-hashed on the CPU: MSVC libm differs from consensus libm
- * (glibc) for large sin/cos arguments and would reject valid shares. The GPU digest
- * is read back and checked instead; the init self-test guards the GPU's libdevice.
+ * Every candidate is re-hashed on the CPU with the node's reference code
+ * (ref/hoohash.c, MIT, vendored unchanged) and submitted on THAT digest. The old
+ * reason for skipping it, "MSVC libm != consensus glibc", did not survive a
+ * measurement: the reference built with MSVC 19.44 (UCRT, /O2 /MT, the miner's
+ * flags) and with glibc 2.35 gave byte-identical digests on 11,004,136 nonces
+ * (2026-11-23), and PePe nodes now build it with openlibm, which agrees too.
+ * The init self-test checks this CPU path against a real block as well.
  */
 #include "miner.h"
 #include "cuda/helper.cuh"
+
+// The reference, compiled in this TU: its "../blake3.h" is algos/hoohash/blake3.h,
+// a shim onto cuda/blake3_device.cuh. Every math call in it takes a double, so C++
+// overload resolution picks the same functions as C. MSBuild does not track this
+// include: touch hoohash.cu after editing anything under ref/.
+#include "ref/hoohash.c"
+
+// Big-endian digest of a raw 80-byte header; the init self-test calls it too.
+extern "C" void hoohash_ref_hash(const void* hdr80, uint8_t out_be[32])
+{
+	hoohashv110(hdr80, 80, out_be);
+}
+
+// CPU digest of one nonce in the kernel's layout (byte-reversed, word 7 = MSB).
+static void hoohash_cpu_vhash(const uint32_t* endiandata, uint32_t nonce, uint32_t* vhash)
+{
+	uint32_t _ALIGN(64) hdr[20];
+	uint8_t be[32];
+	memcpy(hdr, endiandata, 80);
+	be32enc(&hdr[19], nonce);
+	hoohashv110(hdr, 80, be);
+	uint8_t* v = (uint8_t*)vhash;
+	for (int i = 0; i < 32; i++) v[i] = be[31 - i];
+}
+
+// CPU check of a candidate; a GPU/CPU split is a kernel fault worth its own line.
+static bool hoohash_check(int thr_id, const uint32_t* endiandata, const uint32_t* d_slot,
+	uint32_t nonce, const uint32_t* ptarget, uint32_t* vhash)
+{
+	uint32_t _ALIGN(64) gpu[8];
+	cudaMemcpy(gpu, d_slot, 32, cudaMemcpyDeviceToHost);
+	hoohash_cpu_vhash(endiandata, nonce, vhash);
+	if (memcmp(gpu, vhash, 32) != 0)
+		gpulog(LOG_WARNING, thr_id, "GPU/CPU digest mismatch for nonce %08x", nonce);
+	return vhash[7] <= ptarget[7] && fulltest(vhash, ptarget);
+}
 
 static uint32_t* d_hash[MAX_GPUS];
 static bool init[MAX_GPUS] = { 0 };
@@ -52,7 +92,7 @@ extern "C" int scanhash_hoohash(int thr_id, struct work* work, uint32_t max_nonc
 
 		// fail-closed: exits on a KAT mismatch
 		if (hoohash_device_selftest(thr_id))
-			gpulog(LOG_INFO, thr_id, "HoohashV110 self-test OK (real-block KAT + negative)");
+			gpulog(LOG_INFO, thr_id, "HoohashV110 self-test OK (real-block KAT on GPU and CPU + negative)");
 
 		// 16 words/entry: cuda_check_hash (cuda_checkhash_64) strides 64-byte slots.
 		CUDA_CALL_OR_RET_X(cudaMalloc(&d_hash[thr_id], 16 * sizeof(uint32_t) * throughput), 0);
@@ -78,25 +118,21 @@ extern "C" int scanhash_hoohash(int thr_id, struct work* work, uint32_t max_nonc
 		work->nonces[0] = cuda_check_hash(thr_id, throughput, pdata[19], d_hash[thr_id]);
 		if (work->nonces[0] != UINT32_MAX)
 		{
-			const uint32_t Htarg = ptarget[7];
 			uint32_t _ALIGN(64) vhash[8];
+			const uint32_t idx0 = work->nonces[0] - pdata[19];
 
-			// Read the GPU digest for the found nonce (reversed -> fulltest layout).
-			// NO CPU recompute: MSVC libm != consensus glibc would reject valid shares.
-			uint32_t idx0 = work->nonces[0] - pdata[19];
-			cudaMemcpy(vhash, d_hash[thr_id] + idx0 * 16, 32, cudaMemcpyDeviceToHost);
-
-			if (vhash[7] <= Htarg && fulltest(vhash, ptarget))
+			if (hoohash_check(thr_id, endiandata, d_hash[thr_id] + idx0 * 16,
+			                  work->nonces[0], ptarget, vhash))
 			{
 				work->valid_nonces = 1;
 				work_set_target_ratio(work, vhash);
 				work->nonces[1] = cuda_check_hash_suppl(thr_id, throughput, pdata[19], d_hash[thr_id], 1);
 				if (work->nonces[1] != UINT32_MAX)
 				{
-					uint32_t idx1 = work->nonces[1] - pdata[19];
-					cudaMemcpy(vhash, d_hash[thr_id] + idx1 * 16, 32, cudaMemcpyDeviceToHost);
+					const uint32_t idx1 = work->nonces[1] - pdata[19];
 					// Guard the second nonce like the first.
-					if (vhash[7] <= Htarg && fulltest(vhash, ptarget))
+					if (hoohash_check(thr_id, endiandata, d_hash[thr_id] + idx1 * 16,
+					                  work->nonces[1], ptarget, vhash))
 					{
 						bn_set_target_ratio(work, vhash, 1);
 						work->valid_nonces++;

@@ -94,7 +94,13 @@ extern "C" int scanhash_whirlpoolx2(int thr_id,  struct work* work, uint32_t max
 				pdata[19] = foundNonce;
 				return 1;
 			} else {
-				gpulog(LOG_WARNING, thr_id, "result for %08x does not validate on CPU!", foundNonce);
+				/* the slot holds only the lowest candidate: scan on from the next
+				 * nonce, or a valid one above it in this launch is lost */
+				gpu_increment_reject(thr_id);
+				if (!opt_quiet)
+					gpulog(LOG_WARNING, thr_id, "result for %08x does not validate on CPU!", foundNonce);
+				pdata[19] = foundNonce + 1;
+				continue;
 			}
 		}
 

@@ -80,8 +80,11 @@ extern "C" int scanhash_heavyhash(int thr_id, struct work* work, uint32_t max_no
 
     do {
 		int order = 0;
-        work->nonces[0] = heavyhash_cpu_hash(thr_id, throughput, pdata[19], order++);
-        *hashes_done = pdata[19] - first_nonce + throughput;
+		/* the last launch stops at max_nonce: the nonces above it are the next range's */
+		const uint32_t n = (uint32_t)min((uint64_t)throughput, (uint64_t)max_nonce - pdata[19]);
+		if (!n) break;
+        work->nonces[0] = heavyhash_cpu_hash(thr_id, n, pdata[19], order++);
+        *hashes_done = pdata[19] - first_nonce + n;
 
         if (work->nonces[0] != UINT32_MAX)
 		{
@@ -109,7 +112,7 @@ extern "C" int scanhash_heavyhash(int thr_id, struct work* work, uint32_t max_no
 				}
 				return work->valid_nonces;
 			}
-			else if (vhash[7] > Htarg) {
+			else { // failed candidate or top-word tie: scan on from the next nonce
 				gpu_increment_reject(thr_id);
 				if (!opt_quiet)
 					gpulog(LOG_WARNING, thr_id, "result for %08x does not validate on CPU!", work->nonces[0]);
@@ -118,11 +121,11 @@ extern "C" int scanhash_heavyhash(int thr_id, struct work* work, uint32_t max_no
 			}
         }
 
-        if ((uint64_t)throughput + pdata[19] >= max_nonce) {
+        if ((uint64_t)n + pdata[19] >= max_nonce) {
 			pdata[19] = max_nonce;
 			break;
 		}
-		pdata[19] += throughput;
+		pdata[19] += n;
     } while (!work_restart[thr_id].restart);
 
     *hashes_done = pdata[19] - first_nonce;

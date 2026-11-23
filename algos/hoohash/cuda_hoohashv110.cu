@@ -213,13 +213,21 @@ static bool hoohash_kat_run(const uint8_t hdr[80], uint32_t nonce, uint8_t out_b
 	return true;
 }
 
-// Init self-test, fail-closed (there is no host re-verify for this algo).
-//   kat - the real block above must hash to its published digest.
+// The CPU reference that re-verifies every candidate (hoohash.cu).
+extern "C" void hoohash_ref_hash(const void* hdr80, uint8_t out_be[32]);
+
+// Init self-test, fail-closed.
+//   kat - the real block above must hash to its published digest on the GPU.
 //   neg - a flipped header bit must change the digest.
+//   cpu - the CPU reference must hash the same block to the same digest, or it
+//         would reject every share.
 extern "C" bool hoohash_device_selftest(int thr_id)
 {
-	uint8_t got[32], neg[32];
+	uint8_t got[32], neg[32], cpu[32];
 	bool kat_ok = false, neg_ok = false;
+
+	hoohash_ref_hash(hoohash_kat_header, cpu);
+	const bool cpu_ok = (memcmp(cpu, hoohash_kat_expected, 32) == 0);
 
 	if (hoohash_kat_run(hoohash_kat_header, 0x4d94e755u, got))
 		kat_ok = (memcmp(got, hoohash_kat_expected, 32) == 0);
@@ -234,10 +242,10 @@ extern "C" bool hoohash_device_selftest(int thr_id)
 	cudaMemcpyToSymbol(c_hoohash_header, hoohash_kat_header, 80, 0, cudaMemcpyHostToDevice);
 	hoohash_gen_all();
 
-	const bool passed = kat_ok && neg_ok;
+	const bool passed = kat_ok && neg_ok && cpu_ok;
 	if (!passed)
-		gpulog(LOG_ERR, thr_id, "HoohashV110 self-test FAILED (kat %d neg %d)"
-			" -- libdevice != consensus libm?", (int)kat_ok, (int)neg_ok);
+		gpulog(LOG_ERR, thr_id, "HoohashV110 self-test FAILED (kat %d neg %d cpu %d)"
+			" -- libdevice or host libm != consensus libm?", (int)kat_ok, (int)neg_ok, (int)cpu_ok);
 
 	return selftest_gate(thr_id, "HoohashV110", passed);
 }

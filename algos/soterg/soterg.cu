@@ -308,7 +308,7 @@ extern "C" int scanhash_soterg(int thr_id, struct work* work, uint32_t max_nonce
     for (int k=0; k < 19; k++)
         be32enc(&endiandata[k], pdata[k]);
 
-    static uint32_t _ALIGN(64) prevblock[8];
+    uint32_t _ALIGN(64) prevblock[8];   /* per call: the time hash is per thread */
 
     uint32_t ntime = swab32(pdata[17]);
 
@@ -317,7 +317,7 @@ extern "C" int scanhash_soterg(int thr_id, struct work* work, uint32_t max_nonce
         getprevblock(ntime, &prevblock);
         getAlgoString(&prevblock[0], hashOrder);
         s_ntime = ntime;
-        if (!thr_id) applog(LOG_INFO, "hash order: %s time: (%08x) time hash: (%08x)", hashOrder, ntime, prevblock);
+        if (!thr_id) applog(LOG_INFO, "hash order: %s time: (%08x) time hash: (%08x)", hashOrder, ntime, prevblock[0]);
 
         /* map soterg ids -> shared fused ids, then find maximal runs of >= 2
          * fusible 64-byte stages (positions 1..HASH_FUNC_COUNT-1); the id
@@ -396,8 +396,6 @@ extern "C" int scanhash_soterg(int thr_id, struct work* work, uint32_t max_nonce
             return -1;
         }
     }
-
-    int warn = 0;
 
     do {
         int order = 0;
@@ -556,18 +554,14 @@ extern "C" int scanhash_soterg(int thr_id, struct work* work, uint32_t max_nonce
                 }
                 return work->valid_nonces;
             }
-            else if (vhash[7] > Htarg) {
+            else {
+                // failed candidate or top-word tie: count and log it, scan on from the next nonce
                 gpu_increment_reject(thr_id);
                 algo80_fails[algo80]++;
-                if (!warn) {
-                    warn++;
-                    pdata[19] = work->nonces[0] + 1;
-                    continue;
-                } else {
-                    if (!opt_quiet) gpulog(LOG_WARNING, thr_id, "result for %08x does not validate on CPU! %s %s",
+                if (!opt_quiet) gpulog(LOG_WARNING, thr_id, "result for %08x does not validate on CPU! %s %s",
                         work->nonces[0], algo_strings[algo80], hashOrder);
-                    warn = 0;
-                }
+                pdata[19] = work->nonces[0] + 1;
+                continue;
             }
         }
 
