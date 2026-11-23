@@ -252,6 +252,16 @@ static int scanhash_equihash_dig24(int thr_id, struct work *work, uint32_t max_n
 	if (opt_benchmark)
 		ptarget[7] = 0xfffff;
 
+	// the CUDA current device is per host thread and defaults to 0; select ours
+	// before equi24b allocates its arena, or every thread lands on GPU 0
+	const cudaError_t dev_err = cudaSetDevice(device_map[thr_id]);
+	if (dev_err != cudaSuccess) {
+		gpulog(LOG_ERR, thr_id, "equihash%d/%d: cannot select CUDA device %d: %s",
+		       eq_wn, eq_wk, device_map[thr_id], cudaGetErrorString(dev_err));
+		proper_exit(EXIT_CODE_CUDA_ERROR);
+		return -1;
+	}
+
 	if (!init[thr_id]) {
 		// equi24b is the only solver for these variants: a card that cannot hold
 		// the arena cannot mine them, and says so.
@@ -554,10 +564,19 @@ void free_equihash(int thr_id)
 	if (!init[thr_id])
 		return;
 
+	// the frees below must hit this thread's GPU, whichever thread calls us
+	cudaSetDevice(device_map[thr_id]);
+
 	if (equi24b_ctx[thr_id]) {            // 144/5 + 192/7 (equi24b) path
 		if (eq_wk == 7) equi24b_192_free(equi24b_ctx[thr_id]);
 		else            equi24b_144_free(equi24b_ctx[thr_id]);
 		equi24b_ctx[thr_id] = NULL;
+		if (equi24b_pipe[thr_id]) {
+			if (eq_wk == 7) equi24b_192_pipe_free(equi24b_pipe[thr_id]);
+			else            equi24b_144_pipe_free(equi24b_pipe[thr_id]);
+			equi24b_pipe[thr_id] = NULL;
+		}
+		eq_pend_n[thr_id] = 0;            // the queued solves died with the pipe
 	} else if (solvers[thr_id]) {         // 200/9 (djeZo) path
 		// assume config 1 was used... interface destructor seems bad
 		eq_cuda_context<CONFIG_MODE_1>* ptr = dynamic_cast<eq_cuda_context<CONFIG_MODE_1>*>(solvers[thr_id]);

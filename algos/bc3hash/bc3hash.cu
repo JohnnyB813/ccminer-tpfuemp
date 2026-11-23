@@ -719,19 +719,20 @@ extern "C" int scanhash_bc3hash(int thr_id, struct work* work, uint32_t max_nonc
 		if (res[0] != UINT32_MAX) {
 			/* all candidates and resume at the batch end, else the two lowest */
 			const bool all = res[2] <= BC3_SLOTS;
-			uint32_t cand[BC3_SLOTS], n = 0;
+			/* nc, not n: n is the batch size the resume below needs */
+			uint32_t cand[BC3_SLOTS], nc = 0;
 			if (all) {
 				for (uint32_t i = 0; i < res[2]; i++) {
-					uint32_t j = n++;
+					uint32_t j = nc++;
 					for (; j > 0 && cand[j - 1] > res[3 + i]; j--) cand[j] = cand[j - 1];
 					cand[j] = res[3 + i];
 				}
 			} else {
-				cand[n++] = res[0];
-				cand[n++] = res[1];
+				cand[nc++] = res[0];
+				cand[nc++] = res[1];
 			}
 			work->valid_nonces = 0;
-			for (uint32_t s = 0; s < n; s++) {
+			for (uint32_t s = 0; s < nc; s++) {
 				uint32_t _ALIGN(64) vhash[8];
 				be32enc(&endiandata[19], cand[s]);
 				bc3hash_hash(vhash, endiandata);
