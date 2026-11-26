@@ -34,7 +34,7 @@ slots; slot 0 is architecture 1 (KEP1, 784 inputs, 26,000 weights).
 | `nebhash2.c` / `nebhash2.h` | Authoritative portable C reference for nebhash v2 (KEP1/RET2): model init, sample gradient, share evaluation, ticket, model step and state hashes. |
 | `nebhash2_table_cuda.cu` / `.h` | The CUDA scan kernel: one block per nonce, table of per-sample gradients, `dp4a` for the linear layers. |
 | `shares.c` / `shares.h` | Portable reference for the original (v1) training-share PoW and the shared constants (`NEB_NB=16`, `NEB_CLIP=256`, ...). |
-| `blake3_min.c`, `chacha8.c` | Small shared BLAKE3 and ChaCha8 implementations used by both references. |
+| `chacha8.c` | Portable ChaCha8 used by both references. BLAKE3 is the tree's shared `cuda/blake3_device.cuh` (kernel, host bridge and both C references). |
 | `LICENSE.NEB` | Apache-2.0 licence for the vendored reference code. |
 
 The scan window adapts to the target: about `targetdiff / 8` nonces per `scan_run`
@@ -77,7 +77,7 @@ models have few all-zero error rows, so the gain depends on the model state.
 
 ## Provenance
 
-`nebhash2.{c,h}`, `shares.{c,h}`, `blake3_min.{c,h}`, `chacha8.{c,h}` and the
+`nebhash2.{c,h}`, `shares.{c,h}`, `chacha8.{c,h}` and the
 reference-derived table kernel are vendored from the NEB implementation under
 Apache-2.0 (`LICENSE.NEB`). The ccminer bridge and stratum glue follow the
 project's GPLv2.

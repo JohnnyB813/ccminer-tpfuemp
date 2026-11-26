@@ -14,12 +14,12 @@
 /* The copied reference files are compiled as C; their public headers do not
  * all carry extern "C" guards, so include them under C linkage here. */
 extern "C" {
-#include "algos/nebhash/blake3_min.h"
 #include "algos/nebhash/shares.h"
 #include "algos/nebhash/chacha8.h"
 #include "algos/nebhash/nebhash2.h"
 #include "algos/nebhash/nebhash2_table_cuda.h"
 }
+#include "cuda/blake3_device.cuh"
 
 #include <cuda_runtime.h>
 #ifndef _WIN32
@@ -112,7 +112,7 @@ void hash_parts(const char *tag, size_t taglen,
 	append_bytes(buf, a, alen);
 	append_bytes(buf, b, blen);
 	append_bytes(buf, c, clen);
-	blake3_hash(buf.data(), buf.size(), out);
+	blake3_hash(buf.data(), buf.size(), NULL, out);
 }
 
 int dataset_get(void *ctx, uint32_t index, uint8_t *x)
@@ -154,7 +154,7 @@ int verify_ticket(const Model &m, int slot, const uint8_t header[80], uint8_t ti
 		return -1;
 
 	uint8_t key[32];
-	blake3_hash(header, 80, key);
+	blake3_hash(header, 80, NULL, key);
 
 	neb2_dataset nd;
 	nd.n = ds.n;
@@ -196,7 +196,8 @@ bool ensure_scan(int thr_id, int slot, const uint8_t model_hash[32])
 			return false;
 		}
 		ref->arch = a->id;
-		memset(ref->model_hash, 0, 32);
+		/* opening the handle already built and uploaded this model (upstream 43ff9d6) */
+		memcpy(ref->model_hash, model_hash, 32);
 	} else if (ref->arch != a->id) {
 		neb2t_scan_close(ref->h);
 		ref->h = NULL;
@@ -332,7 +333,7 @@ int nebhash_load_dataset_file(const char *path)
 	close_all_scans();
 	g_models.clear();
 	g_datasets = std::move(loaded);
-	blake3_hash(bytes.data(), bytes.size(), g_dataset_hash);
+	blake3_hash(bytes.data(), bytes.size(), NULL, g_dataset_hash);
 	return 0;
 }
 
@@ -430,7 +431,7 @@ int nebhash_build_header(uint32_t version, const uint8_t parent[32],
 		return -1;
 
 	uint8_t coinhash[32], root[32], le[4];
-	blake3_hash(coinbase.data(), coinbase.size(), coinhash);
+	blake3_hash(coinbase.data(), coinbase.size(), NULL, coinhash);
 	hash_parts("leaf", 4, coinhash, 32, NULL, 0, NULL, 0, root);
 	for (size_t i = 0; i < branch_count; i++)
 		hash_parts("node", 4, root, 32, branch + i * 32, 32, NULL, 0, root);

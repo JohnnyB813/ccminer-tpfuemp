@@ -35,7 +35,7 @@ ccminer_SOURCES	= compat/elist.h miner.h compat.h \
 			  algos/bc3hash/bc3hash_oracle.cpp algos/bc3hash/bc3hash.cu \
 			  algos/pearlhash/pearlhash.cu \
 			  algos/nebhash/nebhash.cpp algos/nebhash/nebhash2.c algos/nebhash/shares.c \
-			  algos/nebhash/chacha8.c algos/nebhash/blake3_min.c \
+			  algos/nebhash/chacha8.c \
 			  algos/nebhash/nebhash2_table_cuda.cu \
 			  algos/verthash/verthash.cu algos/verthash/cuda_verthash.cu \
 			  algos/verthash/verthash-cpu.c algos/verthash/verthash-data.cpp \
@@ -273,6 +273,11 @@ algos/bc3hash/bc3hash.o: algos/bc3hash/bc3hash.cu algos/bc3hash/cuda/bc3_constan
 # pearlhash: list the headers, the .cu is mostly them (header-only oracle + kernels)
 algos/pearlhash/pearlhash.o: algos/pearlhash/pearlhash.cu algos/pearlhash/pearl_device.cuh \
 		algos/pearlhash/pearl_ref.h algos/pearlhash/pearl_proof.h cuda/blake3_device.cuh
+	$(NVCC) $(nvcc_FLAGS) --maxrregcount=128 -o $@ -c $<
+
+# nebhash: the kernel inlines the shared BLAKE3 and the reference architecture tables
+algos/nebhash/nebhash2_table_cuda.o: algos/nebhash/nebhash2_table_cuda.cu algos/nebhash/nebhash2_table_cuda.h \
+		algos/nebhash/nebhash2.h cuda/blake3_device.cuh
 	$(NVCC) $(nvcc_FLAGS) --maxrregcount=128 -o $@ -c $<
 
 algos/blake256/blake256.o: algos/blake256/blake256.cu

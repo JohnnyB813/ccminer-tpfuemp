@@ -511,9 +511,6 @@
     <ClCompile Include="algos\nebhash\chacha8.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="algos\nebhash\blake3_min.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="algos\verthash\verthash-cpu.c">
       <Filter>Source Files</Filter>
     </ClCompile>
