@@ -691,7 +691,10 @@ int nebhash_scanhash(int thr_id, struct work *work, uint32_t max_nonce,
 	}
 
 	*hashes_done = count;
-	work->data[19] = start + count;   /* <= max_nonce, no wrap */
+	/* Leave the LAST scanned nonce, not the next one: on unchanged work the miner loop
+	 * adds 1 before the next call (ccminer.cpp, nonceptr[0]++), so start + count here
+	 * skipped one nonce per call. start + count - 1 < max_nonce, no wrap (count >= 1). */
+	work->data[19] = start + count - 1;
 
 	std::shared_ptr<Model> m = find_model(work->neb_model_hash);
 	int found = 0;
