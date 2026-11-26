@@ -103,6 +103,82 @@ __global__ void header_prefix(const uint32_t *header, uint32_t *cv) {
   b3_compress(iv, first, 64, 1u, cv);
 }
 
+// One linear layer of an attempt. With FIXED (cin % 8 == 0; THREADS % 8 == 0 below), every entry f = o * cin + q of
+// this thread has f & 7 == q & 7 == tid & 7, so it adds into ONE lane: a plain accumulator replaces the runtime-indexed
+// lane[f & 7], which ptxas turned into an 8-way compare + predicated read and write per entry. Sums are mod 2^32, so
+// the order of the additions does not change the ticket. !FIXED keeps the per-entry lane index.
+static_assert(THREADS % 8 == 0, "the fixed lane index needs THREADS % 8 == 0");
+template <bool FIXED>
+__device__ __forceinline__ void linear_layer(const uint8_t *__restrict__ rows, const uint32_t *rb, const int32_t *S,
+                                             int i, int tid, const int *act, int nact, uint32_t base, uint32_t *lane) {
+  const int cin = P.cin[i];
+  const int xat = P.at[i] + P.cout[i];
+  uint32_t acc = 0;
+  for (int q = tid; q < cin; q += THREADS) {
+    int32_t x[4];
+    for (int w = 0; w < 4; w++) {
+      uint32_t v = 0;
+      for (int b = 0; b < 4; b++)
+        v |= (uint32_t)__ldg(&rows[rb[4 * w + b] + xat + q]) << (8 * b);
+      x[w] = (int32_t)v;
+    }
+    for (int j = 0; j < nact; j++) {
+      const int o = act[j];
+      const int32_t *d = S + P.sh_d[i] + 4 * o;
+      int G = 0;
+      G = __dp4a(d[0], x[0], G);
+      G = __dp4a(d[1], x[1], G);
+      G = __dp4a(d[2], x[2], G);
+      G = __dp4a(d[3], x[3], G);
+      const uint32_t f = (uint32_t)(o * cin + q);
+      const int cg = G < -CLIPV ? -CLIPV : (G > CLIPV ? CLIPV : G);
+      const uint32_t v = ((uint32_t)cg ^ (f + base)) - (f + base);
+      if (FIXED) acc += v; else lane[f & 7] += v;
+    }
+  }
+  if (FIXED) lane[tid & 7] += acc;
+}
+
+// Linear layer, two inputs per thread (needs cin % 8 == 0 and an even xat): one 16-bit load per sample brings
+// x[q] and x[q+1] of that sample, so 16 loads serve two input columns instead of 32 byte loads. Bytes of four
+// samples are transposed with PRMT into the sample-packed words the dp4a takes (byte k = sample 4w + k), exactly the
+// words the byte-load path builds. Lane of every entry: q & 7 = (2 * tid + j) & 7, two fixed accumulators.
+__device__ __forceinline__ void linear_layer_pairs(const uint8_t *__restrict__ rows, const uint32_t *rb, const int32_t *S,
+                                                   int i, int tid, const int *act, int nact, uint32_t base, uint32_t *lane) {
+  const int cin = P.cin[i];
+  const int xat = P.at[i] + P.cout[i];
+  uint32_t acc0 = 0, acc1 = 0;
+  for (int q = 2 * tid; q < cin; q += 2 * THREADS) {
+    int32_t x0[4], x1[4];
+#pragma unroll
+    for (int w = 0; w < 4; w++) {
+      const uint32_t a = __ldg((const unsigned short *)(rows + rb[4 * w + 0] + xat + q));
+      const uint32_t b = __ldg((const unsigned short *)(rows + rb[4 * w + 1] + xat + q));
+      const uint32_t c = __ldg((const unsigned short *)(rows + rb[4 * w + 2] + xat + q));
+      const uint32_t d = __ldg((const unsigned short *)(rows + rb[4 * w + 3] + xat + q));
+      const uint32_t t01 = a | (b << 16), t23 = c | (d << 16);  // bytes: s0q s0q1 s1q s1q1 | s2q s2q1 s3q s3q1
+      x0[w] = (int32_t)__byte_perm(t01, t23, 0x6420);
+      x1[w] = (int32_t)__byte_perm(t01, t23, 0x7531);
+    }
+    for (int j = 0; j < nact; j++) {
+      const int o = act[j];
+      const int32_t *d = S + P.sh_d[i] + 4 * o;
+      const int32_t d0 = d[0], d1 = d[1], d2 = d[2], d3 = d[3];
+      int G0 = __dp4a(d0, x0[0], 0), G1 = __dp4a(d0, x1[0], 0);
+      G0 = __dp4a(d1, x0[1], G0); G1 = __dp4a(d1, x1[1], G1);
+      G0 = __dp4a(d2, x0[2], G0); G1 = __dp4a(d2, x1[2], G1);
+      G0 = __dp4a(d3, x0[3], G0); G1 = __dp4a(d3, x1[3], G1);
+      const uint32_t f0 = (uint32_t)(o * cin + q), f1 = f0 + 1;
+      const int c0 = G0 < -CLIPV ? -CLIPV : (G0 > CLIPV ? CLIPV : G0);
+      const int c1 = G1 < -CLIPV ? -CLIPV : (G1 > CLIPV ? CLIPV : G1);
+      acc0 += ((uint32_t)c0 ^ (f0 + base)) - (f0 + base);
+      acc1 += ((uint32_t)c1 ^ (f1 + base)) - (f1 + base);
+    }
+  }
+  lane[(2 * tid) & 7] += acc0;
+  lane[(2 * tid + 1) & 7] += acc1;
+}
+
 __global__ void __launch_bounds__(THREADS) table_kernel(const uint8_t *__restrict__ rows, uint32_t n,
                                                         const uint32_t *__restrict__ h0, uint32_t start,
                                                         const uint32_t *__restrict__ bound, uint32_t *hits,
@@ -157,37 +233,18 @@ __global__ void __launch_bounds__(THREADS) table_kernel(const uint8_t *__restric
   for (int i = 0; i < P.nlayers; i++) {
     const uint32_t base = 7919u * (uint32_t)(i + 1);
     if (P.kind[i] == LINEAR) {
-      const int cin = P.cin[i], cout = P.cout[i];
-      const int xat = P.at[i] + cout;
-      for (int q = tid; q < cin; q += THREADS) {
-        int32_t x[4];
-        for (int w = 0; w < 4; w++) {
-          uint32_t v = 0;
-          for (int b = 0; b < 4; b++)
-            v |= (uint32_t)__ldg(&rows[rb[4 * w + b] + xat + q]) << (8 * b);
-          x[w] = (int32_t)v;
-        }
-        for (int j = 0; j < active_count[i]; j++) {
-          const int o = active[i][j];
-          const int32_t *d = S + P.sh_d[i] + 4 * o;
-          const int32_t d0 = d[0], d1 = d[1], d2 = d[2], d3 = d[3];
-          int G = 0;
-          {
-            G = __dp4a(d0, x[0], G);
-            G = __dp4a(d1, x[1], G);
-            G = __dp4a(d2, x[2], G);
-            G = __dp4a(d3, x[3], G);
-          }
-          const uint32_t f = (uint32_t)(o * cin + q);
-          const int cg = G < -CLIPV ? -CLIPV : (G > CLIPV ? CLIPV : G);
-          lane[f & 7] += ((uint32_t)cg ^ (f + base)) - (f + base);
-        }
-      }
+      if ((P.cin[i] & 7) == 0 && ((P.at[i] + P.cout[i]) & 1) == 0)
+        linear_layer_pairs(rows, rb, S, i, tid, active[i], active_count[i], base, lane);
+      else if ((P.cin[i] & 7) == 0)
+        linear_layer<true>(rows, rb, S, i, tid, active[i], active_count[i], base, lane);
+      else
+        linear_layer<false>(rows, rb, S, i, tid, active[i], active_count[i], base, lane);
     } else {
       if (P.kind[i] == NARROW8) {
         // Four consecutive int8 factors occupy one aligned word. Transpose the
         // bytes of four rows so each resulting word holds one factor from four
         // samples, then dp4a sums those four samples with no 16-bit truncation.
+        uint32_t acc4[4] = {0, 0, 0, 0};  // lane (4 * tid + j) & 7, fixed per thread and j
         for (int f0 = 4 * tid; f0 < P.nw[i]; f0 += 4 * THREADS) {
           int G0 = 0, G1 = 0, G2 = 0, G3 = 0;
 #pragma unroll
@@ -211,10 +268,13 @@ __global__ void __launch_bounds__(THREADS) table_kernel(const uint8_t *__restric
             const int f = f0 + j;
             if (f >= P.nw[i]) break;
             const int cg = G[j] < -CLIPV ? -CLIPV : (G[j] > CLIPV ? CLIPV : G[j]);
-            lane[f & 7] += (uint32_t)cg ^ ((uint32_t)f + base);
+            acc4[j] += (uint32_t)cg ^ ((uint32_t)f + base);
           }
         }
+#pragma unroll
+        for (int j = 0; j < 4; j++) lane[(4 * tid + j) & 7] += acc4[j];
       } else {
+        uint32_t acc = 0;  // lane tid & 7 for every f of this thread
         for (int f = tid; f < P.nw[i]; f += THREADS) {
           int G = 0;
           if (P.kind[i] == NARROW) {
@@ -223,8 +283,9 @@ __global__ void __launch_bounds__(THREADS) table_kernel(const uint8_t *__restric
             for (int b = 0; b < NEB_NB; b++) G += __ldg((const int32_t *)(rows + rb[b] + P.at[i] + 4 * f));
           }
           const int cg = G < -CLIPV ? -CLIPV : (G > CLIPV ? CLIPV : G);
-          lane[f & 7] += (uint32_t)cg ^ ((uint32_t)f + base);
+          acc += (uint32_t)cg ^ ((uint32_t)f + base);
         }
+        lane[tid & 7] += acc;
       }
     }
   }
