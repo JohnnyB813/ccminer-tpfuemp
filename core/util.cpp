@@ -39,6 +39,7 @@
 #include "compat/elist.h"
 
 #include "algos/cryptonight/xmr-rpc.h"
+#include "algos/nebhash/nebhash.h"
 
 extern pthread_mutex_t stratum_sock_lock;
 extern pthread_mutex_t stratum_work_lock;
@@ -1293,7 +1294,8 @@ void stratum_free_job(struct stratum_ctx *sctx)
 		free(sctx->job.merkle);
 	}
 	free(sctx->job.coinbase);
-	// note: xnonce2 is not allocated
+	free(sctx->job.neb_branch);
+	// xnonce2 is either inside coinbase or the job's own neb_xnonce2 array.
 	memset(&(sctx->job.job_id), 0, sizeof(struct stratum_job));
 	pthread_mutex_unlock(&stratum_work_lock);
 }
@@ -1334,6 +1336,9 @@ static const char *get_stratum_session_id(json_t *val)
 	json_t *arr_val;
 	int i, n;
 
+	if (opt_algo == ALGO_NEBHASH && json_is_object(val))
+		return json_string_value(json_object_get(val, "session"));
+
 	arr_val = json_array_get(val, 0);
 	if (!arr_val || !json_is_array(arr_val))
 		return NULL;
@@ -1357,12 +1362,18 @@ static bool stratum_parse_extranonce(struct stratum_ctx *sctx, json_t *params, i
 	const char* xnonce1;
 	int xn2_size;
 
-	xnonce1 = json_string_value(json_array_get(params, pndx));
+	/* neb-pool/1 answers mining.subscribe with an object, not the usual array. */
+	if (opt_algo == ALGO_NEBHASH && json_is_object(params)) {
+		xnonce1 = json_string_value(json_object_get(params, "extranonce1"));
+		xn2_size = (int) json_integer_value(json_object_get(params, "extranonce2_size"));
+	} else {
+		xnonce1 = json_string_value(json_array_get(params, pndx));
+		xn2_size = (int) json_integer_value(json_array_get(params, pndx+1));
+	}
 	if (!xnonce1) {
 		applog(LOG_ERR, "Failed to get extranonce1");
 		goto out;
 	}
-	xn2_size = (int) json_integer_value(json_array_get(params, pndx+1));
 	if (opt_algo == ALGO_VERUS) {
 		/* the miner owns the rest of the 32-byte nNonce, whatever the pool
 		 * declares; only 7 extranonce1 bytes reach the hashed nonce space */
@@ -1444,7 +1455,9 @@ bool stratum_subscribe(struct stratum_ctx *sctx)
 start:
 	const char *ua = opt_user_agent ? opt_user_agent : USER_AGENT;
 	s = (char*)malloc(128 + strlen(ua) + (sctx->session_id ? strlen(sctx->session_id) : 0));
-	if (retry)
+	if (opt_algo == ALGO_NEBHASH)
+		sprintf(s, "{\"id\": 1, \"method\": \"mining.subscribe\", \"params\": [\"%s\", \"neb-pool/1\"]}", ua);
+	else if (retry)
 		sprintf(s, "{\"id\": 1, \"method\": \"mining.subscribe\", \"params\": []}");
 	else if (sctx->session_id)
 		sprintf(s, "{\"id\": 1, \"method\": \"mining.subscribe\", \"params\": [\"%s\", \"%s\"]}", ua, sctx->session_id);
@@ -1488,6 +1501,30 @@ start:
 			applog(LOG_ERR, "JSON-RPC call failed: %s", s);
 		}
 		goto out;
+	}
+
+	/* neb-pool/1 pins the dataset by its BLAKE3 hash: mining without the exact
+	 * file produces no accepted shares, so refuse the session early. */
+	if (opt_algo == ALGO_NEBHASH) {
+		const char *dh = json_string_value(json_object_get(res_val, "dataset_hash"));
+		const char *cid = json_string_value(json_object_get(res_val, "chain_id"));
+		uint8_t expected[32], actual[32];
+
+		if (!nebhash_dataset_loaded()) {
+			applog(LOG_ERR, "Nebhash: load neb-datasets.bin first (--neb-dataset)");
+			goto out;
+		}
+		if (!dh || strlen(dh) != 64 || !hex2bin(actual, dh, 32)) {
+			applog(LOG_ERR, "Nebhash: subscribe has no valid dataset_hash");
+			goto out;
+		}
+		nebhash_dataset_hash(expected);
+		if (memcmp(expected, actual, 32)) {
+			applog(LOG_ERR, "Nebhash: pool dataset hash does not match the local file");
+			goto out;
+		}
+		if (cid && opt_debug)
+			applog(LOG_DEBUG, "Nebhash chain id: %s", cid);
 	}
 
 	// sid is param 1, extranonce params are 2 and 3
@@ -1583,7 +1620,7 @@ bool stratum_authorize(struct stratum_ctx *sctx, const char *user, const char *p
 	ret = true;
 
 	/* Pearl jobs carry no extranonce */
-	if (!opt_extranonce || opt_algo == ALGO_PEARLHASH)
+	if (!opt_extranonce || opt_algo == ALGO_PEARLHASH || opt_algo == ALGO_NEBHASH)
 		goto out;
 
 	// subscribe to extranonce (optional)
@@ -1922,6 +1959,187 @@ static bool lumenite_stratum_notify(struct stratum_ctx *sctx, json_t *params)
 	return true;
 }
 
+static bool nebhash_json_u32(json_t *j, uint32_t *out)
+{
+	if (!j)
+		return false;
+	if (json_is_integer(j)) {
+		*out = (uint32_t) json_integer_value(j);
+		return true;
+	}
+	if (json_is_string(j)) {
+		const char *s = json_string_value(j);
+		char *end = NULL;
+		unsigned long long v = strtoull(s, &end, 0);
+		if (end == s || *end)
+			return false;
+		*out = (uint32_t) v;
+		return true;
+	}
+	return false;
+}
+
+static bool nebhash_json_hex(json_t *j, unsigned char *out, size_t len)
+{
+	const char *s = j ? json_string_value(j) : NULL;
+	return s && strlen(s) == 2 * len && hex2bin(out, s, len);
+}
+
+// neb-pool/1 mining.set_target: 32-byte little-endian pool target.
+static bool nebhash_stratum_set_target(struct stratum_ctx *sctx, json_t *params)
+{
+	unsigned char target[32];
+	if (!nebhash_json_hex(json_array_get(params, 0), target, 32)) {
+		applog(LOG_ERR, "Nebhash set_target: invalid target");
+		return false;
+	}
+	/* Notify takes stratum_work_lock and then reads the target; keep the same
+	 * lock order here to avoid deadlocking against a concurrent job. */
+	pthread_mutex_lock(&stratum_work_lock);
+	nebhash_set_target(target);
+	sctx->job.diff = nebhash_target_to_diff(target);
+	sctx->next_diff = sctx->job.diff;
+	pthread_mutex_unlock(&stratum_work_lock);
+	return true;
+}
+
+// neb-pool/1 mining.set_model: [slot, weights_hash, packed_weights]. The
+// reference's model hash check is done in nebhash_set_model().
+static bool nebhash_stratum_set_model(struct stratum_ctx *sctx, json_t *params)
+{
+	uint32_t slot;
+	unsigned char hash[32];
+	const char *w = json_string_value(json_array_get(params, 2));
+	size_t packed_len;
+	unsigned char *packed;
+	int rc;
+
+	(void) sctx;
+	if (!nebhash_json_u32(json_array_get(params, 0), &slot) ||
+	    !nebhash_json_hex(json_array_get(params, 1), hash, 32) ||
+	    !w || (strlen(w) & 1)) {
+		applog(LOG_ERR, "Nebhash set_model: invalid parameters");
+		return false;
+	}
+	packed_len = strlen(w) / 2;
+	if (!packed_len || packed_len > 65536) {
+		applog(LOG_ERR, "Nebhash set_model: bad weights length %zu", packed_len);
+		return false;
+	}
+	packed = (unsigned char*) malloc(packed_len);
+	if (!packed || !hex2bin(packed, w, packed_len)) {
+		free(packed);
+		return false;
+	}
+	rc = nebhash_set_model((int) slot, hash, packed, packed_len);
+	free(packed);
+	if (rc) {
+		applog(LOG_ERR, "Nebhash set_model: slot %u rejected (%d)", slot, rc);
+		return false;
+	}
+	if (opt_debug)
+		applog(LOG_DEBUG, "Nebhash model for slot %u accepted", slot);
+	return true;
+}
+
+// neb-pool/1 mining.notify: one job object as the sole parameter.
+static bool nebhash_stratum_notify(struct stratum_ctx *sctx, json_t *params)
+{
+	json_t *j = json_array_get(params, 0);
+	const char *job_id;
+	const char *cp, *cs;
+	json_t *j_branch;
+	size_t branch_count, i;
+	unsigned char *branch = NULL;
+	uint32_t version, time_start, bits, tx_count, slot, expiry, height;
+	/* decoded into locals first: the job is only touched under
+	 * stratum_work_lock, and a rejected notify leaves it intact */
+	unsigned char parent[32], target[32], share_target[32], shares_root[32], weights_hash[32];
+	struct stratum_job *job = &sctx->job;
+
+	if (!json_is_object(j)) {
+		applog(LOG_ERR, "Nebhash notify: expected a job object");
+		return false;
+	}
+	job_id = json_string_value(json_object_get(j, "job_id"));
+	cp = json_string_value(json_object_get(j, "coinbase_prefix"));
+	cs = json_string_value(json_object_get(j, "coinbase_suffix"));
+	j_branch = json_object_get(j, "branch");
+	branch_count = json_array_size(j_branch);
+
+	/* job->job_id is a heap pointer here, not the fixed work->job_id buffer. */
+	if (!job_id || !*job_id || strlen(job_id) >= 64 ||
+	    !cp || (strlen(cp) & 1) || strlen(cp) / 2 > sizeof(job->neb_cb_prefix) ||
+	    !cs || (strlen(cs) & 1) || strlen(cs) / 2 > sizeof(job->neb_cb_suffix) ||
+	    branch_count > 4096 ||
+	    !nebhash_json_u32(json_object_get(j, "version"), &version) ||
+	    !nebhash_json_u32(json_object_get(j, "time_start"), &time_start) ||
+	    !nebhash_json_u32(json_object_get(j, "bits"), &bits) ||
+	    !nebhash_json_u32(json_object_get(j, "tx_count"), &tx_count) ||
+	    !nebhash_json_u32(json_object_get(j, "slot"), &slot) ||
+	    !nebhash_json_u32(json_object_get(j, "expiry"), &expiry) ||
+	    !nebhash_json_hex(json_object_get(j, "parent"), parent, 32) ||
+	    !nebhash_json_hex(json_object_get(j, "target"), target, 32) ||
+	    !nebhash_json_hex(json_object_get(j, "share_target"), share_target, 32) ||
+	    !nebhash_json_hex(json_object_get(j, "shares_root"), shares_root, 32) ||
+	    !nebhash_json_hex(json_object_get(j, "weights_hash"), weights_hash, 32)) {
+		applog(LOG_ERR, "Nebhash notify: invalid job fields");
+		return false;
+	}
+	if (branch_count) {
+		branch = (unsigned char*) malloc(branch_count * 32);
+		if (!branch) {
+			applog(LOG_ERR, "Nebhash notify: cannot allocate %zu branch entries", branch_count);
+			return false;
+		}
+	}
+	for (i = 0; i < branch_count; i++) {
+		if (!nebhash_json_hex(json_array_get(j_branch, i), branch + i * 32, 32)) {
+			applog(LOG_ERR, "Nebhash notify: invalid merkle branch %zu", i);
+			free(branch);
+			return false;
+		}
+	}
+	if (sctx->xnonce2_size > (int)sizeof(job->neb_xnonce2)) {
+		applog(LOG_ERR, "Nebhash notify: extranonce2 size %zu too large", sctx->xnonce2_size);
+		free(branch);
+		return false;
+	}
+
+	pthread_mutex_lock(&stratum_work_lock);
+	free(job->job_id);
+	job->job_id = strdup(job_id);
+	memcpy(job->neb_parent, parent, 32);
+	memcpy(job->neb_target, target, 32);
+	memcpy(job->neb_share_target, share_target, 32);
+	memcpy(job->neb_shares_root, shares_root, 32);
+	memcpy(job->neb_weights_hash, weights_hash, 32);
+	job->neb_version = version;
+	job->neb_time_start = time_start;
+	job->neb_bits = bits;
+	job->neb_tx_count = tx_count;
+	job->neb_slot = (uint8_t) slot;
+	job->neb_expiry = expiry;
+	job->neb_cb_prefix_len = strlen(cp) / 2;
+	job->neb_cb_suffix_len = strlen(cs) / 2;
+	hex2bin(job->neb_cb_prefix, cp, job->neb_cb_prefix_len);
+	hex2bin(job->neb_cb_suffix, cs, job->neb_cb_suffix_len);
+	free(job->neb_branch);
+	job->neb_branch = branch;
+	job->neb_branch_count = branch_count;
+	nebhash_get_target(job->neb_pool_target);
+	memset(job->neb_xnonce2, 0, sizeof(job->neb_xnonce2));
+	job->xnonce2 = job->neb_xnonce2;
+	job->height = nebhash_json_u32(json_object_get(j, "height"), &height) ? height : 0;
+	job->clean = json_object_get(j, "clean") ? json_is_true(json_object_get(j, "clean")) : true;
+	job->diff = nebhash_target_to_diff(job->neb_share_target);
+	if (!(job->diff > 0.))
+		job->diff = sctx->next_diff;
+	job->is_nebhash = true;
+	pthread_mutex_unlock(&stratum_work_lock);
+	return true;
+}
+
 static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 {
 	const char *job_id, *prevhash, *coinb1, *coinb2, *version, *nbits, *stime;
@@ -1949,6 +2167,8 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 	if (is_progpow_algo(opt_algo)) {
 		return kawpow_stratum_notify(sctx, params);
 	}
+	if (opt_algo == ALGO_NEBHASH)
+		return nebhash_stratum_notify(sctx, params);
 	if (opt_algo == ALGO_PEARLHASH)
 		return pearl_stratum_notify(sctx, params);
 	/* Set-only in kawpow_stratum_notify(): reaching here means this job is not a
@@ -2369,6 +2589,49 @@ static bool stratum_unknown_method(struct stratum_ctx *sctx, json_t *id)
 	return ret;
 }
 
+static void nebhash_json_scalar(json_t *j, char *out, size_t len)
+{
+	out[0] = '\0';
+	if (!j)
+		return;
+	if (json_is_string(j))
+		snprintf(out, len, "%s", json_string_value(j));
+	else if (json_is_integer(j))
+		snprintf(out, len, "%lld", (long long) json_integer_value(j));
+}
+
+// neb-pool/1 extension: only sent after the node accepted a block candidate.
+// mining.submit is answered earlier, so this is the first reliable solve.
+// Yiimp sends an object {job_id, extranonce2, ntime, nonce, blockhash, height};
+// the positional [job_id, nonce?, blockhash?] form is kept for older pools.
+static bool nebhash_stratum_block(struct stratum_ctx *sctx, json_t *params)
+{
+	json_t *obj = NULL, *arr = NULL;
+	char job[96], nonce[96], hash[96];
+
+	if (params) {
+		if (json_typeof(params) == JSON_OBJECT)
+			obj = params;
+		else if (json_typeof(params) == JSON_ARRAY)
+			arr = params;
+	}
+	if (!obj && !arr)
+		return false;
+
+	nebhash_json_scalar(obj ? json_object_get(obj, "job_id") : json_array_get(arr, 0),
+	                    job, sizeof(job));
+	nebhash_json_scalar(obj ? json_object_get(obj, "nonce") : json_array_get(arr, 1),
+	                    nonce, sizeof(nonce));
+	nebhash_json_scalar(obj ? json_object_get(obj, "blockhash") : json_array_get(arr, 2),
+	                    hash, sizeof(hash));
+
+	if (!job[0] && !hash[0])
+		return false;
+
+	stratum_block_accepted(sctx, job, nonce, hash);
+	return true;
+}
+
 bool stratum_handle_method(struct stratum_ctx *sctx, const char *s)
 {
 	json_t *val, *id, *params;
@@ -2402,6 +2665,10 @@ bool stratum_handle_method(struct stratum_ctx *sctx, const char *s)
 		goto out;
 	}
 	if (!strcasecmp(method, "mining.set_target")) {
+		if (opt_algo == ALGO_NEBHASH) {
+			ret = nebhash_stratum_set_target(sctx, params);
+			goto out;
+		}
 		if (is_progpow_algo(opt_algo)) {
 			ret = kawpow_stratum_set_target(sctx, params);
 			goto out;
@@ -2409,6 +2676,18 @@ bool stratum_handle_method(struct stratum_ctx *sctx, const char *s)
 		sctx->is_equihash = true;
 		ret = equi_stratum_set_target(sctx, params);
 		goto out;
+	}
+	if (!strcasecmp(method, "mining.set_model")) {
+		if (opt_algo == ALGO_NEBHASH) {
+			ret = nebhash_stratum_set_model(sctx, params);
+			goto out;
+		}
+	}
+	if (!strcasecmp(method, "mining.block")) {
+		if (opt_algo == ALGO_NEBHASH) {
+			ret = nebhash_stratum_block(sctx, params);
+			goto out;
+		}
 	}
 	if (!strcasecmp(method, "mining.set_extranonce")) {
 		ret = stratum_parse_extranonce(sctx, params, 0);

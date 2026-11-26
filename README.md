@@ -100,6 +100,7 @@ Select with `-a <name>`. Common aliases are shown in parentheses.
 | `minotaurx` | MinotaurX (Avian, Pulsar): yespower 1.0 r=8 behind an x16 walk |
 | `mjollnir` | Mjollnir (Hefty hash) |
 | `myr-gr` | Myriad-Groestl |
+| `nebhash` (`neb`) | NEB, neb-pool/1 model-training PoW; needs `neb-datasets.bin` (`--neb-dataset`) |
 | `neoscrypt` | NeoScrypt (FeatherCoin, Phoenix, UFO…) |
 | `xaya` (`neoscrypt-xaya`) | NeoScrypt (XAYA variant) |
 | `nist5` | NIST5 (TalkCoin) |

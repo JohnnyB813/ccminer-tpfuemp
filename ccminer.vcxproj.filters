@@ -499,6 +499,21 @@
     <ClCompile Include="algos\curvehash\secp256k1_unity.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="algos\nebhash\nebhash.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="algos\nebhash\nebhash2.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="algos\nebhash\shares.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="algos\nebhash\chacha8.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="algos\nebhash\blake3_min.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="algos\verthash\verthash-cpu.c">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -1429,6 +1444,9 @@
       <Filter>Source Files\CUDA</Filter>
     </CudaCompile>
     <CudaCompile Include="algos\pearlhash\pearlhash.cu">
+      <Filter>Source Files\CUDA</Filter>
+    </CudaCompile>
+    <CudaCompile Include="algos\nebhash\nebhash2_table_cuda.cu">
       <Filter>Source Files\CUDA</Filter>
     </CudaCompile>
     <CudaCompile Include="algos\verthash\verthash.cu">

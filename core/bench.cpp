@@ -8,6 +8,7 @@
 
 #include "miner.h"
 #include "algos.h"
+#include "algos/nebhash/nebhash.h"
 #include <cuda_runtime.h>
 
 #ifdef __APPLE__
@@ -130,6 +131,7 @@ void algo_free_all(int thr_id)
 	free_curvehash(thr_id);
 	free_bc3hash(thr_id);
 	free_pearlhash(thr_id);
+	nebhash_free(thr_id);
 	free_kawpow(thr_id);
 	free_meowpow(thr_id);
 	free_evrprogpow(thr_id);
@@ -185,6 +187,7 @@ bool bench_algo_switch_next(int thr_id)
 	if (algo == ALGO_WILDKECCAK) algo++;
 	if (algo == ALGO_ANIME) algo++; // to fix
 	if (algo == ALGO_QUARK) algo++; // to fix
+	if (algo == ALGO_NEBHASH) algo++; // needs a pool-sent model
 	if (algo == ALGO_LBRY && CUDART_VERSION < 7000) algo++;
 
 	if (device_sm[dev_id] && device_sm[dev_id] < 300) {

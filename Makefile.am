@@ -34,6 +34,9 @@ ccminer_SOURCES	= compat/elist.h miner.h compat.h \
 			  algos/curvehash/curvehash_oracle.cpp algos/curvehash/curvehash.cu algos/curvehash/secp256k1_unity.c \
 			  algos/bc3hash/bc3hash_oracle.cpp algos/bc3hash/bc3hash.cu \
 			  algos/pearlhash/pearlhash.cu \
+			  algos/nebhash/nebhash.cpp algos/nebhash/nebhash2.c algos/nebhash/shares.c \
+			  algos/nebhash/chacha8.c algos/nebhash/blake3_min.c \
+			  algos/nebhash/nebhash2_table_cuda.cu \
 			  algos/verthash/verthash.cu algos/verthash/cuda_verthash.cu \
 			  algos/verthash/verthash-cpu.c algos/verthash/verthash-data.cpp \
 			  cuda/sha3_device.cuh \

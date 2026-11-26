@@ -88,6 +88,7 @@ its command line interface and options.
                           minotaurx           MinotaurX (Avian, Pulsar)
                           mjollnir            Mjollnir (Hefty hash)
                           myr-gr              Myriad-Groestl
+                          nebhash / neb       NEB (neb-pool/1, needs neb-datasets.bin)
                           neoscrypt           NeoScrypt (FeatherCoin, Phoenix, UFO...)
                           xaya                NeoScrypt (XAYA variant)
                           nist5               NIST5 (TalkCoin)
@@ -208,6 +209,7 @@ its command line interface and options.
       --api-control     Allow the API to pause/resume/stop mining at runtime
       --api-control-min-interval=N  Seconds between accepted state changes (default: 15)
       --api-control-park-timeout=N  Milliseconds to wait for threads to idle (default: 30000)
+      --neb-dataset=PATH nebhash dataset file (default: neb-datasets.bin)
       --max-temp=N      Only mine if gpu temp is less than specified value
       --max-rate=N[KMG] Only mine if net hashrate is less than specified value
       --max-diff=N      Only mine if net difficulty is less than specified value
