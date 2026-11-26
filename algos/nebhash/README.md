@@ -57,6 +57,18 @@ occupancy. The eight lane accumulators are reduced per warp and then summed
 once by thread 0, instead of 256 shared-memory atomics per lane. All sums are
 modulo `2^32`, so changing the order does not change the ticket.
 
+The scan handle caches the BLAKE3 chaining value of the first 64 header bytes
+and recomputes it only when those bytes change; each nonce finishes the key
+from the last 16 bytes.
+
+For each linear layer, the kernel skips outputs whose error factors are zero
+in all 16 selected samples. The lane sums start from the contribution of an
+all-zero linear gradient (a per-model constant) and add the difference for
+each active output, modulo `2^32`, so the ticket is unchanged. On the
+mainnet models of 2026-11-26 this measured +1.3–1.8 % on a GTX 1080 Ti and
++4.2–7.0 % on an RTX 3060 (matched A/B against the previous kernel); trained
+models have few all-zero error rows, so the gain depends on the model state.
+
 ## Provenance
 
 `nebhash2.{c,h}`, `shares.{c,h}`, `blake3_min.{c,h}`, `chacha8.{c,h}` and the
