@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 #include <stdlib.h>
 #include <string.h>
+#include <algorithm>
 #include <thread>
 #include <vector>
 #include "nebhash2.h"
@@ -273,6 +274,37 @@ __global__ void __launch_bounds__(THREADS) table_kernel(const uint8_t *__restric
         }
 #pragma unroll
         for (int j = 0; j < 4; j++) lane[(4 * tid + j) & 7] += acc4[j];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+        // quads only on Pascal: measured +4..10 % on sm_61 but -1..3 % on sm_86 against the pairs below
+      } else if (P.kind[i] == NARROW && (P.nw[i] & 3) == 0) {
+        // int16 factors in quads: one 64-bit load per sample brings f .. f+3 (layers and rows are 8-byte aligned,
+        // 2 * f is a multiple of 8), a quarter of the loads of the per-factor gather. Sums stay 32-bit (exact).
+        // f = 4 * tid + 4 * THREADS * k, so the lanes are (4 * tid + j) & 7: four fixed accumulators.
+        uint32_t acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
+        for (int f = 4 * tid; f < P.nw[i]; f += 4 * THREADS) {
+          int G0 = 0, G1 = 0, G2 = 0, G3 = 0;
+#pragma unroll
+          for (int b = 0; b < NEB_NB; b++) {
+            const uint2 v = __ldg((const uint2 *)(rows + rb[b] + P.at[i] + 2 * f));
+            G0 += (int)(int16_t)(v.x & 0xffffu);
+            G1 += (int)v.x >> 16;
+            G2 += (int)(int16_t)(v.y & 0xffffu);
+            G3 += (int)v.y >> 16;
+          }
+          const int c0 = G0 < -CLIPV ? -CLIPV : (G0 > CLIPV ? CLIPV : G0);
+          const int c1 = G1 < -CLIPV ? -CLIPV : (G1 > CLIPV ? CLIPV : G1);
+          const int c2 = G2 < -CLIPV ? -CLIPV : (G2 > CLIPV ? CLIPV : G2);
+          const int c3 = G3 < -CLIPV ? -CLIPV : (G3 > CLIPV ? CLIPV : G3);
+          acc0 += (uint32_t)c0 ^ ((uint32_t)f + base);
+          acc1 += (uint32_t)c1 ^ ((uint32_t)(f + 1) + base);
+          acc2 += (uint32_t)c2 ^ ((uint32_t)(f + 2) + base);
+          acc3 += (uint32_t)c3 ^ ((uint32_t)(f + 3) + base);
+        }
+        lane[(4 * tid) & 7] += acc0;
+        lane[(4 * tid + 1) & 7] += acc1;
+        lane[(4 * tid + 2) & 7] += acc2;
+        lane[(4 * tid + 3) & 7] += acc3;
+#endif
       } else if (P.kind[i] == NARROW && (P.nw[i] & 1) == 0) {
         // int16 factors in pairs: one 32-bit load per sample brings entries f and f+1 (low / high half; at, the
         // row size and 2 * f are multiples of 4), halving the loads of the gather. Sums stay 32-bit, so they are
@@ -376,84 +408,131 @@ static void make_plan(const neb2_arch *A, const int *wide, const int *narrow8, T
       p->kind[i] = wide[i] ? WIDE : (narrow8[i] ? NARROW8 : NARROW);
       at += wide[i] ? 4 * L.nw : (narrow8[i] ? ((L.nw + 3) & ~3) : 2 * L.nw);
     }
-    at = (at + 3) & ~3;
+    at = (at + 7) & ~7;  // 8-byte aligned layers and rows: the int16 quad path loads 64 bits per sample
   }
   p->row = at;
   p->shared_words = sh;
 }
 
-// Fills the rows of every sample for the weights. Returns the layers whose values do not fit their compact
-// representation: 8 bits for an int8 convolution layer, 16 bits for an int16 convolution layer.
-struct FillStatus { int wide_layer, narrow8_layer; };
+// Per-sample gradients of one model: the convolution entries as int32 (the table width of each layer is chosen
+// afterwards from the range actually seen) and the linear factors (cout errors then cin inputs) as int8.
+struct SampleGrads {
+  std::vector<int32_t> conv;
+  std::vector<int8_t> lin;
+  int conv_w = 0, lin_w = 0;
+};
 
-static FillStatus fill_rows(neb2t_scan *s, const neb2_arch *A, const int8_t *weights) {
+// One evaluation of every sample with neb2_sample_grad of the C reference, on every host thread, recording the range
+// of each convolution layer. The former build loop chose the widths by refilling the whole table once per layer that
+// overflowed int8 or int16, i.e. up to four full gradient passes on mainnet models (~0.65 s each on an i7-7700K),
+// with the GPU idle meanwhile.
+static void sample_grads(neb2t_scan *s, const neb2_arch *A, const int8_t *weights, SampleGrads &sg,
+                         int32_t lo[NEB2_MAX_LAYERS], int32_t hi[NEB2_MAX_LAYERS]) {
   neb2_model *m = (neb2_model *)calloc(1, sizeof *m);
   m->arch = s->arch;
   memcpy(m->w, weights, (size_t)A->nweights);
-  const TPlan &p = s->plan;
-  s->rows.assign((size_t)p.row * s->n, 0);
+  for (int l = 0; l < A->nlayers; l++) {
+    if (A->l[l].kind == NEB2_LINEAR) sg.lin_w += A->l[l].cout + A->l[l].cin;
+    else sg.conv_w += A->l[l].nw;
+  }
+  sg.conv.assign((size_t)sg.conv_w * s->n, 0);
+  sg.lin.assign((size_t)sg.lin_w * s->n, 0);
   unsigned nt = std::thread::hardware_concurrency();
   if (nt == 0) nt = 4;
-  std::vector<int> overflow(nt, -1), overflow8(nt, -1);
+  std::vector<int32_t> tlo((size_t)nt * NEB2_MAX_LAYERS, 0), thi((size_t)nt * NEB2_MAX_LAYERS, 0);
   std::vector<std::thread> th;
   for (unsigned t = 0; t < nt; t++)
     th.emplace_back([&, t] {
       std::vector<int32_t> g(NEB2_MAX_WEIGHTS);
       std::vector<int8_t> fac(2 * NEB2_MAX_WEIGHTS);
+      int32_t *mylo = tlo.data() + (size_t)t * NEB2_MAX_LAYERS, *myhi = thi.data() + (size_t)t * NEB2_MAX_LAYERS;
       for (uint32_t i = t; i < s->n; i += nt) {
         neb2_sample_grad(m, s->values.data() + (size_t)i * A->nin, s->labels[i], g.data(), fac.data());
+        int32_t *c = sg.conv.data() + (size_t)i * sg.conv_w;
+        int8_t *f = sg.lin.data() + (size_t)i * sg.lin_w;
+        const int8_t *fp = fac.data();
+        for (int l = 0; l < A->nlayers; l++) {
+          const neb2_layer &L = A->l[l];
+          if (L.kind == NEB2_LINEAR) {
+            memcpy(f, fp, (size_t)(L.cout + L.cin));
+            f += L.cout + L.cin;
+            fp += L.cout + L.cin;
+          } else {
+            for (int k = 0; k < L.nw; k++) {
+              const int32_t v = g[L.w_off + k];
+              c[k] = v;
+              if (v < mylo[l]) mylo[l] = v;
+              if (v > myhi[l]) myhi[l] = v;
+            }
+            c += L.nw;
+          }
+        }
+      }
+    });
+  for (auto &x : th) x.join();
+  free(m);
+  for (int l = 0; l < NEB2_MAX_LAYERS; l++) {
+    lo[l] = hi[l] = 0;
+    for (unsigned t = 0; t < nt; t++) {
+      lo[l] = std::min(lo[l], tlo[(size_t)t * NEB2_MAX_LAYERS + l]);
+      hi[l] = std::max(hi[l], thi[(size_t)t * NEB2_MAX_LAYERS + l]);
+    }
+  }
+}
+
+// Writes the row of every sample in the layout of s->plan from the stored gradients, on every host thread.
+static void pack_rows(neb2t_scan *s, const neb2_arch *A, const SampleGrads &sg) {
+  const TPlan &p = s->plan;
+  s->rows.assign((size_t)p.row * s->n, 0);
+  unsigned nt = std::thread::hardware_concurrency();
+  if (nt == 0) nt = 4;
+  std::vector<std::thread> th;
+  for (unsigned t = 0; t < nt; t++)
+    th.emplace_back([&, t] {
+      for (uint32_t i = t; i < s->n; i += nt) {
         uint8_t *row = s->rows.data() + (size_t)i * p.row;
-        const int8_t *f = fac.data();
+        const int32_t *c = sg.conv.data() + (size_t)i * sg.conv_w;
+        const int8_t *f = sg.lin.data() + (size_t)i * sg.lin_w;
         for (int l = 0; l < A->nlayers; l++) {
           const neb2_layer &L = A->l[l];
           if (p.kind[l] == LINEAR) {
             memcpy(row + p.at[l], f, (size_t)(L.cout + L.cin));
             f += L.cout + L.cin;
-          } else if (p.kind[l] == WIDE) {
-            memcpy(row + p.at[l], g.data() + L.w_off, (size_t)4 * L.nw);
+            continue;
+          }
+          if (p.kind[l] == WIDE) {
+            memcpy(row + p.at[l], c, (size_t)4 * L.nw);
           } else if (p.kind[l] == NARROW8) {
-            uint8_t *o = (uint8_t *)(row + p.at[l]);
-            for (int k = 0; k < L.nw; k++) {
-              const int32_t v = g[L.w_off + k];
-              if (v < -128 || v > 127) { overflow8[t] = l; break; }
-              o[k] = (uint8_t)(int8_t)v;
-            }
+            uint8_t *o = row + p.at[l];
+            for (int k = 0; k < L.nw; k++) o[k] = (uint8_t)(int8_t)c[k];
           } else {
             int16_t *o = (int16_t *)(row + p.at[l]);
-            for (int k = 0; k < L.nw; k++) {
-              const int32_t v = g[L.w_off + k];
-              if (v < -32768 || v > 32767) overflow[t] = l;
-              o[k] = (int16_t)v;
-            }
+            for (int k = 0; k < L.nw; k++) o[k] = (int16_t)c[k];
           }
+          c += L.nw;
         }
       }
     });
-  for (auto &t : th) t.join();
-  free(m);
-  FillStatus st = {-1, -1};
-  for (int o : overflow) if (o >= 0) st.wide_layer = o;
-  for (int o : overflow8) if (o >= 0) st.narrow8_layer = o;
-  return st;
+  for (auto &x : th) x.join();
 }
 
 static int build(neb2t_scan *s, const int8_t *weights) {
   const neb2_arch *A = neb2_arch_get(s->arch);
-  int wide[NEB2_MAX_LAYERS] = {0}, n8[NEB2_MAX_LAYERS] = {0};
   // the kernel lists the active outputs of a linear layer in a fixed shared array of 32
   for (int i = 0; i < A->nlayers; i++)
     if (A->l[i].kind == NEB2_LINEAR && A->l[i].cout > 32) return (int)cudaErrorInvalidValue;
+  SampleGrads sg;
+  int32_t lo[NEB2_MAX_LAYERS], hi[NEB2_MAX_LAYERS];
+  sample_grads(s, A, weights, sg, lo, hi);
+  // narrowest width that holds every entry of the layer: int8 (dp4a path), else int16, else int32
+  int wide[NEB2_MAX_LAYERS] = {0}, n8[NEB2_MAX_LAYERS] = {0};
   for (int i = 0; i < A->nlayers; i++) {
-    wide[i] = s->plan.kind[i] == WIDE;
-    n8[i] = !wide[i] && A->l[i].kind != NEB2_LINEAR;
+    if (A->l[i].kind == NEB2_LINEAR) continue;
+    if (lo[i] >= -128 && hi[i] <= 127) n8[i] = 1;
+    else if (lo[i] < -32768 || hi[i] > 32767) wide[i] = 1;
   }
-  for (;;) {
-    make_plan(A, wide, n8, &s->plan);
-    const FillStatus st = fill_rows(s, A, weights);
-    if (st.narrow8_layer >= 0) { n8[st.narrow8_layer] = 0; continue; }
-    if (st.wide_layer >= 0) { wide[st.wide_layer] = 1; n8[st.wide_layer] = 0; continue; }
-    break;
-  }
+  make_plan(A, wide, n8, &s->plan);
+  pack_rows(s, A, sg);
   if (s->rows.size() > UINT32_MAX) return (int)cudaErrorInvalidValue;
   TRY(cudaSetDevice(s->device));
   if (s->rows.size() != s->d_rows_bytes) {

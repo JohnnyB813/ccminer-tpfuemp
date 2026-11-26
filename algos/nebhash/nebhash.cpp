@@ -34,11 +34,13 @@ extern "C" {
 #include <cmath>
 
 #define NEB_MAX_SLOTS   16
-/* The table kernel evaluates ~0.44 MH/s on a GTX 1050 Ti, so a larger window
- * still completes in a few tens of milliseconds while amortising the host to
- * device synchronisation of each scan. Keep it below 64k so the hit list cannot
- * overflow at the low difficulties used by vardiff seeding. */
-#define NEB_SCAN_CAP    8192        /* nonces per scan_run call */
+/* Nonces per scan_run call. Each call pays a few uploads and a synchronisation; a
+ * 64k window instead of 8k measured +2-3 % on Linux and +11-12 % on Windows (WDDM).
+ * A call can report at most MAX_NONCES shares, so the window adapts to the target:
+ * about targetdiff / 8 attempts (an expected 1/8 share per call), clamped to
+ * [NEB_SCAN_MIN, NEB_SCAN_CAP]; low vardiff starts fall back to the 8k window. */
+#define NEB_SCAN_MIN    8192
+#define NEB_SCAN_CAP    65536
 #define NEB_MAX_HITS    (MAX_NONCES + 1)
 
 namespace {
@@ -466,9 +468,13 @@ int nebhash_scanhash(int thr_id, struct work *work, uint32_t max_nonce,
 	uint32_t start = work->data[19];
 	if (start >= max_nonce)
 		return 0;
+	uint32_t window = NEB_SCAN_MIN;
+	if (work->targetdiff / 8.0 > (double)NEB_SCAN_MIN)
+		window = work->targetdiff / 8.0 >= (double)NEB_SCAN_CAP ? NEB_SCAN_CAP
+		                                                       : (uint32_t)(work->targetdiff / 8.0);
 	uint32_t count = max_nonce - start;
-	if (count > NEB_SCAN_CAP)
-		count = NEB_SCAN_CAP;
+	if (count > window)
+		count = window;
 
 	uint8_t header[80];
 	memcpy(header, work->neb_header, 80);

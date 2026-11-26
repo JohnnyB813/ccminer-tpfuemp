@@ -37,11 +37,17 @@ slots; slot 0 is architecture 1 (KEP1, 784 inputs, 26,000 weights).
 | `blake3_min.c`, `chacha8.c` | Small shared BLAKE3 and ChaCha8 implementations used by both references. |
 | `LICENSE.NEB` | Apache-2.0 licence for the vendored reference code. |
 
-`NEB_SCAN_CAP` (8192 nonces per `scan_run`) keeps a scan window inside a job's
-lifetime while amortising host/device synchronisation; the hit list is
-`MAX_NONCES + 1` entries. A scan never crosses `max_nonce`, the end of the
-thread's nonce slice: GPUs share one header, so overrunning it would duplicate
-another GPU's nonces.
+The scan window adapts to the target: about `targetdiff / 8` nonces per `scan_run`
+(an expected 1/8 share per call, so the `MAX_NONCES + 1` hit list does not overflow),
+clamped to 8192..65536. Each call pays a few uploads and a synchronisation; the 64k
+window measured +2-3 % on Linux and +11-12 % on Windows against a fixed 8k window. A scan
+never crosses `max_nonce`, the end of the thread's nonce slice: GPUs share one header, so
+overrunning it would duplicate another GPU's nonces.
+
+For each model the host evaluates every sample once and picks the narrowest exact width per
+convolution layer (int8, else int16, else int32) from the observed range, instead of refilling
+the table once per overflowing layer: the per-model rebuild fell from 2.7 s to 0.7 s on a
+4-core host for a mainnet Kepler model.
 
 The upstream bring-up kernel `nebhash2_cuda.cu` (direct forward/backward pass,
 never called by the miner) is not carried in this tree.
