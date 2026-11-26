@@ -108,6 +108,13 @@ is `mining.set_target`. Target-to-difficulty uses yiimp's
   `mining.submit`; a kernel bug can only cause a local miss, never a bad share.
 - `NEB_NEGATIVE_CONTROL_TABLE_CLIP` deliberately clips one below `NEB_CLIP` so
   the differential test demonstrates that it detects a wrong gradient.
+- Every table a mining thread uploads (scan open and each model change) is
+  self-tested before use: the C reference tickets of 32 nonces of a fixed
+  header, then the GPU hit set through the shipping launcher at a bound equal
+  to the second-lowest ticket (exactly the two lowest nonces) and at that
+  ticket minus one (exactly the lowest). A mismatch stops the miner; a CUDA
+  resource failure only warns. `NEBHASH_SELFTEST_FAULT=1` or `=2` injects a
+  wrong bound into one leg and must stop it (testing only).
 
 ## Usage
 
@@ -120,6 +127,12 @@ ccminer -a nebhash \
 
 `stratum+tcps://` is accepted as an alias for `stratum+ssl://`. TLS certificate
 verification stays enabled; use `--cert` only to supply a custom CA bundle.
+
+`--benchmark -a nebhash --neb-dataset=...` mines a synthetic job: a model of
+slot 0 drawn from a fixed seed (an untrained model, so its rate is only
+comparable with other benchmark runs, not with a live pool), a header per
+thread and a target of one share per 2^22 attempts. Every hit is re-verified
+on the CPU like a pool share, and the counts are logged every 30 s.
 
 ## Benchmark log
 

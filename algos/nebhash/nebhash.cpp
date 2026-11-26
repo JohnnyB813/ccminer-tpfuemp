@@ -20,6 +20,7 @@ extern "C" {
 #include "algos/nebhash/nebhash2_table_cuda.h"
 }
 #include "cuda/blake3_device.cuh"
+#include "cuda/selftest_gate.cuh"
 
 #include <cuda_runtime.h>
 #ifndef _WIN32
@@ -32,6 +33,8 @@ extern "C" {
 #include <cstring>
 #include <cstdio>
 #include <cmath>
+#include <algorithm>
+#include <thread>
 
 #define NEB_MAX_SLOTS   16
 /* Nonces per scan_run call. Each call pays a few uploads and a synchronisation; a
@@ -42,6 +45,10 @@ extern "C" {
 #define NEB_SCAN_MIN    8192
 #define NEB_SCAN_CAP    65536
 #define NEB_MAX_HITS    (MAX_NONCES + 1)
+/* In-miner self-test: CPU tickets of this many nonces of a fixed header. */
+#define NEB_ST_N        32
+/* --benchmark: one share per 2^22 attempts (a few per second), each re-verified on the CPU. */
+#define NEB_BENCH_BITS  22
 
 namespace {
 
@@ -77,6 +84,19 @@ uint8_t g_dataset_hash[32] = { 0 };
 uint8_t g_target[32] = { 0 };         /* set by mining.set_target */
 ScanHandle *g_scans[MAX_GPUS][NEB_MAX_SLOTS];
 char g_dataset_path[512] = { 0 };
+
+/* --benchmark: a synthetic job per mining thread (seeded model of slot 0, own header and target)
+ * with a private cursor, because the benchmark loop rewrites the work and its nonce on every call. */
+struct BenchJob {
+	bool ready = false;
+	uint8_t header[80];
+	uint32_t cursor = 0;
+	uint64_t hits = 0, verified = 0;
+	time_t last_log = 0;
+};
+BenchJob g_bench[MAX_GPUS];
+uint8_t g_bench_model[32];
+bool g_bench_ready = false;
 
 uint32_t read_le32(const uint8_t *p)
 {
@@ -167,6 +187,95 @@ int verify_ticket(const Model &m, int slot, const uint8_t header[80], uint8_t ti
 	                       NULL, NULL);
 }
 
+/* Little-endian 256-bit compare, strict. */
+bool le_lt(const uint8_t a[32], const uint8_t b[32])
+{
+	return le_le(a, b) && memcmp(a, b, 32) != 0;
+}
+
+/* In-miner check of every table this thread uploads (V-01/V-02/V-12): the CPU reference
+ * tickets of NEB_ST_N nonces of a fixed header, then the GPU hit set through the shipping
+ * launcher at bound = the 2nd lowest ticket (exactly the two lowest nonces) and at that
+ * ticket - 1 (exactly the lowest). A mismatch refuses to mine (selftest_gate); a failure to
+ * run (CUDA resource, host memory) only warns. NEBHASH_SELFTEST_FAULT=1 gives the GPU the
+ * 3rd lowest ticket for the first leg, =2 the 2nd lowest for the second leg: both must fail. */
+bool scan_selftest(int thr_id, neb2t_scan *h, const Model &m, int slot)
+{
+	static bool logged[MAX_GPUS];
+	const char *fenv = getenv("NEBHASH_SELFTEST_FAULT");
+	const int fault = fenv ? atoi(fenv) : 0;
+	if (fault)
+		gpulog(LOG_WARNING, thr_id, "nebhash: SELF-TEST FAULT INJECTION ACTIVE (%d) -- for testing only", fault);
+	struct timeval t0, t1;
+	gettimeofday(&t0, NULL);
+
+	uint8_t header[80];
+	for (int i = 0; i < 80; i++)
+		header[i] = (uint8_t)(i * 37 + 11);
+	const uint32_t start = 0x104d;   /* not aligned to anything */
+	struct Tk { uint8_t t[32]; uint32_t nonce; } v[NEB_ST_N];
+	std::vector<std::thread> th;
+	int bad = 0;
+	std::mutex bad_lock;
+	unsigned nt = std::thread::hardware_concurrency();
+	if (nt == 0) nt = 4;
+	if (nt > NEB_ST_N) nt = NEB_ST_N;
+	for (unsigned t = 0; t < nt; t++)
+		th.emplace_back([&, t] {
+			uint8_t hd[80];
+			memcpy(hd, header, 80);
+			for (unsigned i = t; i < NEB_ST_N; i += nt) {
+				v[i].nonce = start + i;
+				write_le32(hd + 76, v[i].nonce);
+				if (verify_ticket(m, slot, hd, v[i].t) != 0) {
+					std::lock_guard<std::mutex> lock(bad_lock);
+					bad++;
+				}
+			}
+		});
+	for (auto &x : th) x.join();
+	if (bad) {
+		gpulog(LOG_WARNING, thr_id, "nebhash self-test could not run (CPU reference failed), continuing");
+		return true;
+	}
+	std::sort(v, v + NEB_ST_N, [](const Tk &a, const Tk &b) { return le_lt(a.t, b.t); });
+
+	uint8_t bound[32];
+	uint32_t hits[NEB_MAX_HITS + 1], nh = 0;
+	bool ran = true, leg_a = false, leg_b = false;
+
+	memcpy(bound, v[fault == 1 ? 2 : 1].t, 32);
+	if (neb2t_scan_run(h, header, start, NEB_ST_N, bound, hits, &nh) != 0)
+		ran = selftest_cuda_fault();
+	else
+		leg_a = nh == 2 && ((hits[0] == v[0].nonce && hits[1] == v[1].nonce) ||
+		                    (hits[0] == v[1].nonce && hits[1] == v[0].nonce));
+
+	memcpy(bound, v[1].t, 32);
+	if (fault != 2)
+		for (int i = 0; i < 32 && bound[i]-- == 0; i++) {}   /* bound - 1 */
+	if (ran) {
+		if (neb2t_scan_run(h, header, start, NEB_ST_N, bound, hits, &nh) != 0)
+			ran = selftest_cuda_fault();
+		else
+			leg_b = nh == 1 && hits[0] == v[0].nonce;
+	}
+
+	gettimeofday(&t1, NULL);
+	const double ms = 1e3 * (t1.tv_sec - t0.tv_sec) + 1e-3 * (t1.tv_usec - t0.tv_usec);
+	const bool passed = leg_a && leg_b;
+	if (!passed)
+		gpulog(LOG_ERR, thr_id, "nebhash self-test FAILED (slot %d: GPU hits at rank 2 %s, at rank 2 - 1 %s)", slot,
+			leg_a ? "ok" : (ran ? "WRONG" : "not run"), leg_b ? "ok" : (ran ? "WRONG" : "not run"));
+	else if (!logged[thr_id] || opt_debug) {
+		gpulog(logged[thr_id] ? LOG_DEBUG : LOG_INFO, thr_id,
+			"nebhash self-test passed (slot %d, GPU == CPU hit sets at rank 2 and rank 2 - 1 of %d nonces, %.0f ms)",
+			slot, NEB_ST_N, ms);
+		logged[thr_id] = true;
+	}
+	return selftest_gate(thr_id, "nebhash", passed);
+}
+
 bool ensure_scan(int thr_id, int slot, const uint8_t model_hash[32])
 {
 	if (thr_id < 0 || thr_id >= MAX_GPUS || slot < 0 || slot >= NEB_MAX_SLOTS)
@@ -198,6 +307,7 @@ bool ensure_scan(int thr_id, int slot, const uint8_t model_hash[32])
 		ref->arch = a->id;
 		/* opening the handle already built and uploaded this model (upstream 43ff9d6) */
 		memcpy(ref->model_hash, model_hash, 32);
+		scan_selftest(thr_id, ref->h, *m, slot);
 	} else if (ref->arch != a->id) {
 		neb2t_scan_close(ref->h);
 		ref->h = NULL;
@@ -211,6 +321,7 @@ bool ensure_scan(int thr_id, int slot, const uint8_t model_hash[32])
 			return false;
 		}
 		memcpy(ref->model_hash, model_hash, 32);
+		scan_selftest(thr_id, ref->h, *m, slot);
 	}
 	return true;
 }
@@ -447,11 +558,101 @@ int nebhash_build_header(uint32_t version, const uint8_t parent[32],
 	return 0;
 }
 
+int nebhash_benchmark_init(void)
+{
+	if (g_datasets.empty())
+		return -1;
+	const neb2_arch *a = neb2_arch_get(g_datasets[0].arch);
+	if (!a)
+		return -1;
+	static const uint8_t seed[33] = "ccminer-nebhash-benchmark-seed-0";
+	Model m;
+	m.slot = 0;
+	m.arch = a->id;
+	m.ref.reset(new neb2_model);
+	memset(m.ref.get(), 0, sizeof(neb2_model));
+	if (neb2_model_init(a->id, seed, m.ref.get()) != 0)
+		return -1;
+	m.weights.assign(m.ref->w, m.ref->w + a->nweights);
+	uint8_t rh[32];
+	neb2_model_hashes(m.ref.get(), m.hash, rh);
+	memcpy(g_bench_model, m.hash, 32);
+	std::lock_guard<std::mutex> lock(g_state_lock);
+	g_models.clear();
+	g_models.push_back(std::make_shared<Model>(std::move(m)));
+	g_bench_ready = true;
+	return 0;
+}
+
+/* --benchmark: the seeded model of slot 0 (an untrained model: its rate is not a live rate,
+ * compare benchmarks only with each other), a per-thread header, one share per 2^NEB_BENCH_BITS
+ * attempts. Every GPU hit is re-verified on the CPU exactly as in the pool path. */
+static int bench_scan(int thr_id, struct work *work, unsigned long *hashes_done)
+{
+	BenchJob &b = g_bench[thr_id];
+	if (!b.ready) {
+		for (int i = 0; i < 80; i++)
+			b.header[i] = (uint8_t)(i * 13 + 5 + thr_id);
+		b.cursor = 0;
+		b.ready = true;
+	}
+	if (!g_bench_ready || !ensure_scan(thr_id, 0, g_bench_model)) {
+		usleep(1000 * 1000);
+		return -1;
+	}
+	uint8_t target[32];
+	memset(target, 0xff, 32);
+	target[31] = target[30] = 0;
+	target[29] = (uint8_t)((1u << (256 - NEB_BENCH_BITS - 232)) - 1);   /* 2^(256 - bits) - 1 */
+	const uint32_t start = b.cursor, count = NEB_SCAN_CAP;
+	uint32_t hits[NEB_MAX_HITS + 1], nhits = 0;
+	int rc = neb2t_scan_run(g_scans[thr_id][0]->h, b.header, start, count, target, hits, &nhits);
+	if (rc != 0) {
+		applog(LOG_ERR, "nebhash: scan failed on GPU %d (%d)", device_map[thr_id], rc);
+		usleep(1000 * 1000);
+		return -1;
+	}
+	b.cursor = start + count;
+	if (b.cursor < start) {   /* range exhausted: next header */
+		b.header[0]++;
+		b.cursor = 0;
+	}
+	*hashes_done = count;
+	std::shared_ptr<Model> m = find_model(g_bench_model);
+	uint8_t header[80];
+	memcpy(header, b.header, 80);
+	int found = 0;
+	for (uint32_t i = 0; i < nhits && i < NEB_MAX_HITS; i++) {
+		write_le32(header + 76, hits[i]);
+		uint8_t ticket[32];
+		b.hits++;
+		if (!m || verify_ticket(*m, 0, header, ticket) != 0 || !le_le(ticket, target)) {
+			gpulog(LOG_WARNING, thr_id, "nebhash benchmark: GPU hit %08x does not validate on the CPU", hits[i]);
+			continue;
+		}
+		b.verified++;
+		if (found < MAX_NONCES) {
+			work->nonces[found] = hits[i];
+			work->sharediff[found] = nebhash_target_to_diff(ticket);
+			found++;
+		}
+	}
+	if (time(NULL) - b.last_log >= 30 && b.hits) {
+		gpulog(LOG_INFO, thr_id, "nebhash benchmark: %llu GPU hits, %llu CPU-verified",
+			(unsigned long long)b.hits, (unsigned long long)b.verified);
+		b.last_log = time(NULL);
+	}
+	work->valid_nonces = found;
+	return found;
+}
+
 int nebhash_scanhash(int thr_id, struct work *work, uint32_t max_nonce,
                      unsigned long *hashes_done)
 {
 	*hashes_done = 0;
 	work->valid_nonces = 0;
+	if (opt_benchmark)
+		return bench_scan(thr_id, work, hashes_done);
 	if (!work->is_nebhash || !nebhash_dataset_loaded())
 		return -1;
 

@@ -148,7 +148,16 @@ __device__ __forceinline__ void linear_layer_pairs(const uint8_t *__restrict__ r
   lane[(2 * tid + 1) & 7] += acc1;
 }
 
-__global__ void __launch_bounds__(THREADS) table_kernel(const uint8_t *__restrict__ rows, uint32_t n,
+// Pascal (sm_6x) fits 7 blocks/SM at 72 registers; minBlocks 8 caps it at 64 (4 B spill) for 8 blocks: +10-12 % on the
+// 1080 Ti over 5 live models, but only when this file is built WITHOUT --maxrregcount (with it: +4.5-8 %), hence the
+// per-file override in both build systems. Every sm_75/86 arm lost (minBlocks 10/12 spill: -24..-28 %; THREADS 64/256:
+// -7..-12 %), so those keep the plain bound (sm_75 SASS unchanged, sm_86 neutral without the cap).
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+#define NEB_TABLE_BOUNDS __launch_bounds__(THREADS, 8)
+#else
+#define NEB_TABLE_BOUNDS __launch_bounds__(THREADS)
+#endif
+__global__ void NEB_TABLE_BOUNDS table_kernel(const uint8_t *__restrict__ rows, uint32_t n,
                                                         const uint32_t *__restrict__ h0, uint32_t start,
                                                         const uint32_t *__restrict__ bound, uint32_t *hits,
                                                         uint32_t max_hits, const uint32_t *__restrict__ cv) {

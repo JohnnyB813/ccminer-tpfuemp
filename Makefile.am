@@ -275,10 +275,12 @@ algos/pearlhash/pearlhash.o: algos/pearlhash/pearlhash.cu algos/pearlhash/pearl_
 		algos/pearlhash/pearl_ref.h algos/pearlhash/pearl_proof.h cuda/blake3_device.cuh
 	$(NVCC) $(nvcc_FLAGS) --maxrregcount=128 -o $@ -c $<
 
-# nebhash: the kernel inlines the shared BLAKE3 and the reference architecture tables
+# nebhash: the kernel inlines the shared BLAKE3 and the reference architecture tables. No --maxrregcount: with
+# the sm_6x __launch_bounds__(128, 8) it compiled slower code (sm_61 -4..5 %); sm_75 SASS is identical either way,
+# sm_86 measured neutral. Keep the vcxproj override (MaxRegCount 0) in step.
 algos/nebhash/nebhash2_table_cuda.o: algos/nebhash/nebhash2_table_cuda.cu algos/nebhash/nebhash2_table_cuda.h \
 		algos/nebhash/nebhash2.h cuda/blake3_device.cuh
-	$(NVCC) $(nvcc_FLAGS) --maxrregcount=128 -o $@ -c $<
+	$(NVCC) $(nvcc_FLAGS) -o $@ -c $<
 
 algos/blake256/blake256.o: algos/blake256/blake256.cu
 	$(NVCC) $(nvcc_FLAGS) --maxrregcount=64 -o $@ -c $<

@@ -5229,11 +5229,6 @@ int main(int argc, char *argv[])
 
 	if (opt_algo == ALGO_NEBHASH) {
 		const char *path = nebhash_dataset_option();
-		if (opt_benchmark) {
-			/* the model being trained comes from the pool (mining.set_model) */
-			applog(LOG_ERR, "nebhash has no benchmark mode: it needs a neb-pool/1 pool");
-			return EXIT_CODE_USAGE;
-		}
 		if (!path)
 			path = "neb-datasets.bin";
 		if (nebhash_load_dataset_file(path) != 0) {
@@ -5242,6 +5237,11 @@ int main(int argc, char *argv[])
 		}
 		if (!opt_quiet)
 			applog(LOG_INFO, "Nebhash dataset loaded from %s", path);
+		/* the live model comes from the pool (mining.set_model); the benchmark mines a seeded one */
+		if (opt_benchmark && nebhash_benchmark_init() != 0) {
+			applog(LOG_ERR, "nebhash: cannot set up the benchmark model");
+			return EXIT_CODE_SW_INIT_ERROR;
+		}
 	}
 
 	if (opt_background) {
