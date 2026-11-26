@@ -540,7 +540,9 @@ static json_t *json_rpc_call(CURL *curl, const char *url,
 
 	/* If X-Stratum was found, activate Stratum */
 	if (want_stratum && hi.stratum_url &&
-	    !strncasecmp(hi.stratum_url, "stratum+tcp://", 14) &&
+	    (!strncasecmp(hi.stratum_url, "stratum+tcp://", 14) ||
+	     !strncasecmp(hi.stratum_url, "stratum+ssl://", 14) ||
+	     !strncasecmp(hi.stratum_url, "stratum+tcps://", 15)) &&
 	    !(opt_proxy && opt_proxy_type == CURLPROXY_HTTP)) {
 		have_stratum = true;
 		tq_push(thr_info[stratum_thr_id].q, hi.stratum_url);
@@ -932,10 +934,18 @@ double kawpow_target_to_diff(const unsigned char* target_be)
 #define socket_blocks() (errno == EAGAIN || errno == EWOULDBLOCK)
 #endif
 
-static bool send_line(curl_socket_t sock, char *s)
+/* caller holds stratum_sock_lock */
+static bool send_line(struct stratum_ctx *sctx, char *s)
 {
+	curl_socket_t sock = sctx->sock;
 	ssize_t len, sent = 0;
-	
+	int stalls = 0;
+
+	/* the curl handle is driven by the stratum thread until the handshake
+	 * is done; using it from here before that is not thread-safe */
+	if (sctx->tls && (!sctx->tls_up || !sctx->curl))
+		return false;
+
 	len = (ssize_t)strlen(s);
 	s[len++] = '\n';
 
@@ -948,11 +958,30 @@ static bool send_line(curl_socket_t sock, char *s)
 		FD_SET(sock, &wd);
 		if (select((int)sock + 1, NULL, &wd, NULL, &timeout) < 1)
 			return false;
-		n = send(sock, s + sent, len, 0);
-		if (n < 0) {
-			if (!socket_blocks())
+#if LIBCURL_VERSION_NUM >= 0x071202
+		if (sctx->tls) {
+			/* the TLS layer owns the socket: a raw send() would bypass it */
+			size_t nsent = 0;
+			CURLcode rc = curl_easy_send(sctx->curl, s + sent, (size_t)len, &nsent);
+			if (rc != CURLE_OK && rc != CURLE_AGAIN)
 				return false;
-			n = 0;
+			n = (ssize_t)nsent;
+			/* CURLE_AGAIN on a writable socket (e.g. the TLS layer wants to
+			 * read first) must not spin forever with the lock held */
+			if (!n) {
+				if (++stalls > 50)
+					return false;
+				usleep(100 * 1000);
+			}
+		} else
+#endif
+		{
+			n = send(sock, s + sent, len, 0);
+			if (n < 0) {
+				if (!socket_blocks())
+					return false;
+				n = 0;
+			}
 		}
 		sent += n;
 		len -= n;
@@ -969,7 +998,7 @@ bool stratum_send_line(struct stratum_ctx *sctx, char *s)
 		applog(LOG_DEBUG, "> %s", s);
 
 	pthread_mutex_lock(&stratum_sock_lock);
-	ret = send_line(sctx->sock, s);
+	ret = send_line(sctx, s);
 	pthread_mutex_unlock(&stratum_sock_lock);
 
 	return ret;
@@ -1011,6 +1040,44 @@ static void stratum_buffer_append(struct stratum_ctx *sctx, const char *s)
 	strcpy(sctx->sockbuf + old, s);
 }
 
+#if LIBCURL_VERSION_NUM >= 0x071202
+/* TLS read: append everything the TLS layer can deliver now to sockbuf.
+ * Reads until CURLE_AGAIN because the TLS library may already hold decrypted
+ * bytes that select() on the raw socket no longer reports as readable; left
+ * there, a mining.notify would sit unread until the next packet arrived.
+ * Takes stratum_sock_lock: a TLS session must not be read and written from two
+ * threads at once (submits are sent from another thread).
+ * Returns bytes appended (0 = nothing yet), or -1 on error / closed. */
+static ssize_t stratum_tls_drain(struct stratum_ctx *sctx)
+{
+	ssize_t total = 0;
+
+	pthread_mutex_lock(&stratum_sock_lock);
+	for (;;) {
+		char s[RBUFSIZE];
+		size_t n = 0;
+		CURLcode rc;
+
+		if (!sctx->curl || !sctx->tls_up) {
+			total = -1;
+			break;
+		}
+		memset(s, 0, RBUFSIZE);
+		rc = curl_easy_recv(sctx->curl, s, RECVSIZE, &n);
+		if (rc == CURLE_AGAIN)
+			break;
+		if (rc != CURLE_OK || !n) {
+			total = -1;
+			break;
+		}
+		stratum_buffer_append(sctx, s);
+		total += (ssize_t)n;
+	}
+	pthread_mutex_unlock(&stratum_sock_lock);
+	return total;
+}
+#endif
+
 char *stratum_recv_line(struct stratum_ctx *sctx)
 {
 	ssize_t len, buflen;
@@ -1031,6 +1098,21 @@ char *stratum_recv_line(struct stratum_ctx *sctx)
 			char s[RBUFSIZE];
 			ssize_t n;
 
+#if LIBCURL_VERSION_NUM >= 0x071202
+			if (sctx->tls) {
+				n = stratum_tls_drain(sctx);
+				if (n < 0) {
+					ret = false;
+					break;
+				}
+				/* 0 bytes is normal: the readable data may have been TLS
+				 * records only (TLS 1.3 session tickets) or half a record.
+				 * Wait for more; the loop condition bounds it by timeout. */
+				if (!n)
+					socket_full(sctx->sock, 1);
+				continue;
+			}
+#endif
 			memset(s, 0, RBUFSIZE);
 			n = recv(sctx->sock, s, RECVSIZE, 0);
 			if (!n) {
@@ -1048,6 +1130,10 @@ char *stratum_recv_line(struct stratum_ctx *sctx)
 
 		if (!ret) {
 			if (opt_debug) applog(LOG_ERR, "stratum_recv_line failed");
+			goto out;
+		}
+		if (sctx->tls && !strstr(sctx->sockbuf, "\n")) {
+			applog(LOG_ERR, "stratum_recv_line timed out");
 			goto out;
 		}
 	}
@@ -1072,7 +1158,17 @@ out:
 	return sret;
 }
 
-#if LIBCURL_VERSION_NUM >= 0x071101
+static bool stratum_url_is_tls(const char *url)
+{
+	return !strncasecmp(url, "stratum+ssl://", 14) ||
+	       !strncasecmp(url, "stratum+tcps://", 15) ||
+	       !strncasecmp(url, "https://", 8);
+}
+
+/* curl >= 7.45 reports the connected socket itself (CURLINFO_ACTIVESOCKET);
+ * the opensocket hook is only needed before that, and it can grab the wrong
+ * socket when curl races several connection attempts. */
+#if LIBCURL_VERSION_NUM >= 0x071101 && LIBCURL_VERSION_NUM < 0x072d00
 static curl_socket_t opensocket_grab_cb(void *clientp, curlsocktype purpose,
 	struct curl_sockaddr *addr)
 {
@@ -1087,7 +1183,15 @@ bool stratum_connect(struct stratum_ctx *sctx, const char *url)
 	CURL *curl;
 	int rc;
 
+#if LIBCURL_VERSION_NUM < 0x071202
+	if (stratum_url_is_tls(url)) {
+		applog(LOG_ERR, "Stratum over TLS needs libcurl 7.18.2 or newer");
+		return false;
+	}
+#endif
+
 	pthread_mutex_lock(&stratum_sock_lock);
+	sctx->tls_up = false;
 	if (sctx->curl)
 		curl_easy_cleanup(sctx->curl);
 	sctx->curl = curl_easy_init();
@@ -1102,6 +1206,7 @@ bool stratum_connect(struct stratum_ctx *sctx, const char *url)
 		sctx->sockbuf_size = RBUFSIZE;
 	}
 	sctx->sockbuf[0] = '\0';
+	sctx->tls = stratum_url_is_tls(url);
 	pthread_mutex_unlock(&stratum_sock_lock);
 
 	if (url != sctx->url) {
@@ -1109,9 +1214,19 @@ bool stratum_connect(struct stratum_ctx *sctx, const char *url)
 		sctx->url = strdup(url);
 	}
 	free(sctx->curl_url);
-	sctx->curl_url = (char*)malloc(strlen(url)+1);
-	sprintf(sctx->curl_url, "http%s", strstr(url, "://"));
+	/* libcurl only speaks http(s): map the stratum scheme onto it so that
+	 * CONNECT_ONLY yields a TLS session for stratum+ssl / stratum+tcps */
+	{
+		const char *sep = strstr(url, "://");
+		sctx->curl_url = (char*)malloc(strlen(url) + 8);
+		sprintf(sctx->curl_url, "%s%s", sctx->tls ? "https" : "http", sep ? sep : "://");
+	}
 
+	if (sctx->tls && opt_cert) {
+		/* same policy as the HTTP RPC path: own CA file, any host name */
+		curl_easy_setopt(curl, CURLOPT_CAINFO, opt_cert);
+		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0);
+	}
 	if (opt_protocol)
 		curl_easy_setopt(curl, CURLOPT_VERBOSE, 1);
 	curl_easy_setopt(curl, CURLOPT_URL, sctx->curl_url);
@@ -1134,7 +1249,7 @@ bool stratum_connect(struct stratum_ctx *sctx, const char *url)
 #if LIBCURL_VERSION_NUM >= 0x070f06
 	curl_easy_setopt(curl, CURLOPT_SOCKOPTFUNCTION, sockopt_keepalive_cb);
 #endif
-#if LIBCURL_VERSION_NUM >= 0x071101
+#if LIBCURL_VERSION_NUM >= 0x071101 && LIBCURL_VERSION_NUM < 0x072d00
 	curl_easy_setopt(curl, CURLOPT_OPENSOCKETFUNCTION, opensocket_grab_cb);
 	curl_easy_setopt(curl, CURLOPT_OPENSOCKETDATA, &sctx->sock);
 #endif
@@ -1143,15 +1258,23 @@ bool stratum_connect(struct stratum_ctx *sctx, const char *url)
 	rc = curl_easy_perform(curl);
 	if (rc) {
 		applog(LOG_ERR, "Stratum connection failed: %s", sctx->curl_err_str);
+		if (sctx->tls && (rc == CURLE_SSL_CACERT || rc == CURLE_PEER_FAILED_VERIFICATION))
+			applog(LOG_ERR, "Pool certificate not trusted; pass its CA with --cert=FILE");
 		curl_easy_cleanup(curl);
 		sctx->curl = NULL;
 		return false;
 	}
 
-#if LIBCURL_VERSION_NUM < 0x071101
+#if LIBCURL_VERSION_NUM >= 0x072d00
+	curl_easy_getinfo(curl, CURLINFO_ACTIVESOCKET, &sctx->sock);
+#elif LIBCURL_VERSION_NUM < 0x071101
 	/* CURLINFO_LASTSOCKET is broken on Win64; only use it as a last resort */
 	curl_easy_getinfo(curl, CURLINFO_LASTSOCKET, (long *)&sctx->sock);
 #endif
+
+	pthread_mutex_lock(&stratum_sock_lock);
+	sctx->tls_up = sctx->tls;
+	pthread_mutex_unlock(&stratum_sock_lock);
 
 	return true;
 }
@@ -1189,6 +1312,7 @@ void stratum_disconnect_intentional(struct stratum_ctx *sctx)
 void stratum_disconnect(struct stratum_ctx *sctx)
 {
 	pthread_mutex_lock(&stratum_sock_lock);
+	sctx->tls_up = false;
 	if (sctx->curl) {
 		if (!stratum_disconnect_deliberate)
 			pools[sctx->pooln].disconnects++;
@@ -1982,7 +2106,9 @@ static bool stratum_set_difficulty(struct stratum_ctx *sctx, json_t *params)
 static bool stratum_reconnect(struct stratum_ctx *sctx, json_t *params)
 {
 	json_t *port_val;
-	const char *host;
+	const char *host, *sep;
+	size_t scheme_len;
+	char *url;
 	int port;
 
 	host = json_string_value(json_array_get(params, 0));
@@ -1993,10 +2119,19 @@ static bool stratum_reconnect(struct stratum_ctx *sctx, json_t *params)
 		port = (int) json_integer_value(port_val);
 	if (!host || !port)
 		return false;
-	
+
+	/* keep the current scheme: a TLS pool must not be downgraded to plain
+	 * text when it moves us to another host/port */
+	sep = sctx->url ? strstr(sctx->url, "://") : NULL;
+	scheme_len = sep ? (size_t)(sep - sctx->url) + 3 : 0;
+	url = (char*)malloc(scheme_len + strlen(host) + 32);
+	if (sep) {
+		memcpy(url, sctx->url, scheme_len);
+		sprintf(url + scheme_len, "%s:%d", host, port);
+	} else
+		sprintf(url, "stratum+tcp://%s:%d", host, port);
 	free(sctx->url);
-	sctx->url = (char*)malloc(32 + strlen(host));
-	sprintf(sctx->url, "stratum+tcp://%s:%d", host, port);
+	sctx->url = url;
 
 	applog(LOG_NOTICE, "Server requested reconnection to %s", sctx->url);
 

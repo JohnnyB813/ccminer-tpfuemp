@@ -838,6 +838,8 @@ struct stratum_ctx {
 	char *curl_url;
 	char curl_err_str[CURL_ERROR_SIZE];
 	curl_socket_t sock;
+	bool tls;	// stratum+ssl:// or stratum+tcps://: I/O goes through curl_easy_send/recv
+	bool tls_up;	// TLS handshake done; set/cleared under stratum_sock_lock
 	size_t sockbuf_size;
 	char *sockbuf;
 

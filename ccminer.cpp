@@ -4949,7 +4949,6 @@ BOOL WINAPI ConsoleHandler(DWORD dwType)
 int main(int argc, char *argv[])
 {
 	struct thr_info *thr;
-	long flags;
 	int i;
 
 	// get opt_quiet early
@@ -5095,14 +5094,9 @@ int main(int argc, char *argv[])
 		GetScratchpad();
 	}
 
-	flags = CURL_GLOBAL_ALL;
-	if ( !opt_benchmark )
-		if ( strncasecmp( rpc_url, "https:", 6 )
-			&& strncasecmp(rpc_url, "stratum+ssl://", 14 )
-			&& strncasecmp( rpc_url, "stratum+tcps://", 15 ) )
-			flags &= ~CURL_GLOBAL_SSL;
-
-	if (curl_global_init(flags)) {
+	/* always init SSL: a failover pool, an X-Stratum redirect or an API pool
+	 * switch can move a plain first pool onto a TLS one later */
+	if (curl_global_init(CURL_GLOBAL_ALL)) {
 		applog(LOG_ERR, "CURL initialization failed");
 		return EXIT_CODE_SW_INIT_ERROR;
 	}

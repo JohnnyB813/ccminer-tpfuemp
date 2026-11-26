@@ -211,6 +211,21 @@ source tree stays free of build artefacts.
 - **WSL2:** the CUDA driver library `libcuda.so` lives in `/usr/lib/wsl/lib`
   rather than under the toolkit; `configure.sh` already adds it to `LDFLAGS`.
 
+Stratum over TLS
+----------------
+
+Pool URLs may be `stratum+tcp://` (plain) or `stratum+ssl://` /
+`stratum+tcps://` (TLS). The TLS forms open a real TLS session through libcurl
+(OpenSSL on Linux, Schannel on Windows). This also applies to a TLS URL received
+from an `X-Stratum` header, and a pool's `client.reconnect` keeps the TLS scheme
+instead of falling back to plain text.
+
+The pool certificate is verified against the system trust store. For a pool with
+a self-signed or private CA certificate, pass that CA with `--cert=FILE`; as on
+the HTTP path, the host name is then not checked. Under Schannel (Windows),
+`--cert` may have no effect, so import the CA into the Windows certificate store
+instead. Requires libcurl 7.18.2 or newer.
+
 Monitoring and control
 ----------------------
 
