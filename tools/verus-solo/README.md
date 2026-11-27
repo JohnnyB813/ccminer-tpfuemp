@@ -26,9 +26,19 @@ example, on an RTX 4060 with CUDA 13.4:
 msbuild ccminer.vcxproj /p:Configuration=Release /p:Platform=x64 /p:CudaBuildVersion=13.4 /p:DevArch=89
 ```
 
-`build_gpu.cmd` is a fast standalone build of the **same mining source** for
-development checks. It produces `solo_gpu.exe`, whose three modes have the
-same job protocol. The normal distribution uses `ccminer.exe`.
+`build_gpu.cmd` is a fast standalone build of the **same mining source**. It
+produces `solo_gpu.exe`, whose three modes have the same job protocol. The
+release packages rename this standalone binary to `ccminer-verus-solo` (with
+`.exe` on Windows). It supports VerusHash 2.2 solo mining; the full `ccminer`
+project also compiles this source and retains its existing pool algorithms.
+
+On Linux, run `tools/verus-solo/build_linux.sh` with the CUDA toolkit, GCC,
+and G++ installed. It produces `ccminer-verus-solo-linux-x86_64`. Set
+`GPU_ARCH` to the NVIDIA architecture you intend to run; the default
+`sm_89` targets RTX 40 series. CPU mode can run without an NVIDIA device.
+The Linux release binary is built on Ubuntu 22.04 with CUDA 12.8.1 and needs
+the usual Linux C++ runtime. The Windows release binary is built with CUDA
+13.4 and the static MSVC runtime.
 
 ## Run with your solo node
 

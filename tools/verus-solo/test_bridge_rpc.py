@@ -85,6 +85,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("gpu", "cpu", "hybrid"), default="gpu")
+    parser.add_argument("--miner", type=Path, default=ROOT / "solo_gpu.exe")
     args = parser.parse_args()
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -96,7 +97,7 @@ def main():
         }))
         process = subprocess.Popen([
             sys.executable, str(ROOT / "solo_bridge.py"), "--config", str(config),
-            "--miner", str(ROOT / "solo_gpu.exe"), "--mode", args.mode,
+            "--miner", str(args.miner), "--mode", args.mode,
             "--cpu-threads", "4",
         ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         lines = queue.Queue()
