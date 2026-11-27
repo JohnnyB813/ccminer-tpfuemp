@@ -1,30 +1,39 @@
-# Solo VerusHash 2.2 shortcut miner
+# VerusHash 2.2 solo mining in ccminer
 
-This optional solo miner uses this repository's `algos/verus` implementation.
-It reads a VerusCoin/PBaaS `getblocktemplate` from a local `verusd`, selects a
-four-byte solution extra nonce that gives a verified `case 0x14` fixed point,
-then tests the remaining 56 nonce bits on the GPU. The 32-round CLHash result
-is precomputed once per selected job; the GPU runs the keyed Haraka tail. Every
-GPU candidate is fully rehashed on the CPU before submission.
+One `ccminer` binary supports `--mode gpu`, `--mode cpu`, and `--mode hybrid`
+for node-prepared VerusCoin/PBaaS solo jobs. The Python bridge handles
+`getblocktemplate`, refreshes work, and submits a validated candidate through
+`submitmergedblock`; the same miner executable does all hashing in every mode.
+The regular `ccminer -a verus` Stratum pool path remains available.
 
-This is a separate executable from `ccminer -a verus`. On an ordinary Stratum
-pool job the pool supplies the first seven of the 15 variable nonce bytes;
-those bytes cannot generally be chosen to satisfy the shortcut. The normal
-pool miner remains a full VerusHash 2.2 miner.
+The miner selects a four-byte PBaaS solution extra nonce giving the verified
+`case 0x14` fixed point. It computes the 276-step key once for that job and
+shares its pristine key and fixed CLHash result across CPU and GPU searches.
+In hybrid mode the GPU scans nonce suffix bit 55 = 0 and CPU threads scan bit
+55 = 1, so they cannot repeat each other's nonces. Each potential block is
+fully rehashed on the CPU before the bridge submits it. The miner rejects
+solution versions other than 7 and 8; these are the VerusHash 2.2 formats
+implemented here.
 
-## Build and run on Windows
+## Build
 
-Install Visual Studio 2022 C++ tools, an NVIDIA driver, and the CUDA toolkit.
-The default build targets `sm_89` (RTX 40 series); set `GPU_ARCH` to another
-supported architecture before running `build_gpu.cmd` for a different GPU.
+The main Windows `ccminer.vcxproj` includes the solo CUDA source. Build the
+normal Release x64 project. It defaults to CUDA 11.8; if using a different
+toolkit, pass `CudaBuildVersion` and a supported `DevArch` to MSBuild. For
+example, on an RTX 4060 with CUDA 13.4:
 
 ```powershell
-cd tools/verus-solo
-./build_gpu.cmd
+msbuild ccminer.vcxproj /p:Configuration=Release /p:Platform=x64 /p:CudaBuildVersion=13.4 /p:DevArch=89
 ```
 
-Create `private/rpc.json` with your node's loopback RPC credentials and your
-own Verus R-address:
+`build_gpu.cmd` is a fast standalone build of the **same mining source** for
+development checks. It produces `solo_gpu.exe`, whose three modes have the
+same job protocol. The normal distribution uses `ccminer.exe`.
+
+## Run with your solo node
+
+Create `private/rpc.json` with your node RPC URL, credentials, and Verus
+R-address. The bridge checks coinbase outputs against this address:
 
 ```json
 {
@@ -35,35 +44,38 @@ own Verus R-address:
 }
 ```
 
-The bridge requires a synced node with peers, requests templates with the
-specified payout address, and checks the coinbase outputs before mining.
-Run it with Python 3.10 or newer:
+Run Python 3.10 or newer and point `--miner` to the built ccminer binary.
+If you passed `DevArch=89`, replace `Release` below with `Release-sm89`:
 
 ```powershell
-py solo_bridge.py --config private/rpc.json
+py solo_bridge.py --config private/rpc.json --miner ..\..\x64\Release\ccminer.exe --mode gpu
+py solo_bridge.py --config private/rpc.json --miner ..\..\x64\Release\ccminer.exe --mode cpu --cpu-threads 14
+py solo_bridge.py --config private/rpc.json --miner ..\..\x64\Release\ccminer.exe --mode hybrid --cpu-threads 14
 ```
 
-It polls for new templates and uses `submitmergedblock` for PBaaS solutions.
-If the node advertises a merged target, the miner also checks that easier
-target. Other PBaaS chain rewards depend on those chains' node registrations
-and payout settings. The code accepts solution versions 7 and 8 only and
-refuses v2.3 work.
+CPU mode enters before ccminer's normal CUDA device discovery. The bridge
+requires a synced node with peers and requests templates with the configured
+payout address. If a merged target is advertised, the bridge also checks it.
+Other PBaaS chain rewards depend on those chains' node registrations and
+payout settings. A Stratum pool normally owns the first seven nonce bytes,
+so this selected nonce shortcut does not apply to ordinary pool work.
 
-## Verify before live use
+## Verify
 
-`test/fixtures.json` contains a real Verus `getblocktemplate` fixture. The
-test below starts a fake local JSON-RPC node, checks the configured payout,
-feeds a job to the CUDA miner, checks the GPU against the CPU reference, and
-verifies the complete `submitmergedblock` payload. Its test target is easier
-than the real network target; this is an offline end-to-end test.
+`test/fixtures.json` is a real `getblocktemplate` fixture. For a fast local
+check, build the standalone source and run all three fixture modes:
 
 ```powershell
-py test_bridge_rpc.py
+./build_gpu.cmd
+py solo_bridge.py --fixture test/fixtures.json --mode gpu
+py solo_bridge.py --fixture test/fixtures.json --mode cpu --cpu-threads 4
+py solo_bridge.py --fixture test/fixtures.json --mode hybrid --cpu-threads 4
+py test_bridge_rpc.py --mode gpu
+py test_bridge_rpc.py --mode cpu
+py test_bridge_rpc.py --mode hybrid
 ```
 
-The CUDA miner also checks 64 selected nonces against the full CPU VerusHash
-and 128 GPU target words against the CPU before it starts its mining loop.
-The source comments at `eligible()` and the low-64-bit nonce construction
-explain why the shortcut is valid for selected jobs. The bridge and test use
-only Python's standard library. Credentials and generated jobs stay under
-ignored `private/` and `jobs/` directories.
+The fake RPC test checks a complete `submitmergedblock` payload against the
+fixture. Before mining, the binary checks 64 selected nonces against the full
+host VerusHash; GPU modes also compare 128 GPU target words with the host.
+Generated jobs and RPC credentials stay under ignored `jobs/` and `private/`.

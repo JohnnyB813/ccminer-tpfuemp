@@ -1,5 +1,6 @@
 """End-to-end bridge smoke test with a fake local Verus JSON-RPC server."""
 
+import argparse
 import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hashlib
@@ -82,6 +83,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=("gpu", "cpu", "hybrid"), default="gpu")
+    args = parser.parse_args()
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     with tempfile.TemporaryDirectory(dir=ROOT / "test") as folder:
@@ -92,9 +96,11 @@ def main():
         }))
         process = subprocess.Popen([
             sys.executable, str(ROOT / "solo_bridge.py"), "--config", str(config),
-            "--gpu-exe", str(ROOT / "solo_gpu.exe"),
+            "--miner", str(ROOT / "solo_gpu.exe"), "--mode", args.mode,
+            "--cpu-threads", "4",
         ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         lines = queue.Queue()
+        winner = None
         threading.Thread(target=lambda: [lines.put(x) for x in process.stdout],
                          daemon=True).start()
         deadline = time.monotonic() + 15
@@ -104,13 +110,19 @@ def main():
                     line = lines.get(timeout=1).strip()
                 except queue.Empty:
                     continue
-                if line.startswith(("JOB", "READY", "GPU_CHECK", "SUBMIT", "SUBMIT_ERROR", "NODE")):
+                if line.startswith("WINNER "):
+                    winner = line.split(" ", 1)[1]
+                if line.startswith(("JOB", "READY", "GPU_CHECK", "WINNER", "SUBMIT", "SUBMIT_ERROR", "NODE")):
                     print(line)
                 if line.startswith("SUBMIT "):
                     assert len(submitted) == 1
+                    if args.mode == "hybrid":
+                        assert winner in ("CPU", "GPU")
+                        assert bool(submitted[0][1486] & 0x80) == (winner == "CPU")
                     digest = line.rsplit("hash=", 1)[1]
                     assert int(digest, 16) > int(template["target"], 16)
-                    print("RPC_BRIDGE_OK submitted_bytes=", len(submitted[0]), sep="")
+                    print(f"RPC_BRIDGE_OK mode={args.mode} "
+                          f"submitted_bytes={len(submitted[0])}")
                     return
                 if line.startswith("SUBMIT_ERROR"):
                     raise AssertionError(line)

@@ -1,14 +1,16 @@
-// Solo VerusHash 2.2 GPU miner. Input is a node block template prepared by
-// solo_bridge.py; output is an unchanged block header/solution except for the
-// four-byte PBaaS solution extra nonce and the last 15 solution nonce bytes.
-// This is a separate solo entry point: a Stratum pool normally owns the first
-// seven nonce bytes, so ccminer's ordinary -a verus path cannot select them.
+// Solo VerusHash 2.2 miner. A single selected job and key feed the GPU, CPU,
+// or both. The bridge supplies node templates; ordinary Stratum mining keeps
+// using ccminer's existing -a verus path because pools own nonce bytes.
 #include <cuda_runtime.h>
-#include "verus/verus_warp.cuh"
-#include "verus/verus_host.h"
+#include "../../algos/verus/verus_warp.cuh"
+#include "../../algos/verus/verus_host.h"
+extern "C" {
+#include "../../algos/verus/haraka.h"
+}
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -16,9 +18,12 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 struct BenchJob { uint32_t cb[16]; };
 
@@ -125,10 +130,140 @@ static void prepare_job(BenchJob &job, const uint8_t half[64], const uint8_t non
     std::memset(reinterpret_cast<uint8_t *>(job.cb) + 43, 0, 4);
 }
 
-int main(int argc, char **argv) {
+struct SoloResult {
+    std::atomic<bool> stop{false};
+    std::mutex mutex;
+    bool found = false;
+    std::array<uint8_t, PREIMAGE_BYTES> preimage{};
+    std::array<uint8_t, 32> digest{};
+    std::string worker;
+    std::exception_ptr error;
+
+    void publish(const char *source, const uint8_t *raw, const uint8_t hash[32]) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (found) return;
+        std::memcpy(preimage.data(), raw, PREIMAGE_BYTES);
+        std::memcpy(digest.data(), hash, 32);
+        worker = source;
+        found = true;
+        stop.store(true, std::memory_order_relaxed);
+    }
+    void fail(std::exception_ptr cause) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!error) error = cause;
+        stop.store(true, std::memory_order_relaxed);
+    }
+};
+
+// Each CPU thread owns its Haraka input. The key and CLHash intermediate are
+// immutable after the selected class passes the 64 full-hash checks above.
+// In hybrid mode, suffix bit 55 is one here and zero on the GPU.
+struct CpuSearch {
+    SoloResult &result;
+    std::atomic<uint64_t> next{0}, done{0};
+    std::atomic<unsigned> active{0};
+    std::array<uint8_t, PREIMAGE_BYTES> base_raw{}, base_canonical{};
+    std::vector<std::thread> workers;
+    explicit CpuSearch(SoloResult &r) : result(r) {}
+    ~CpuSearch() { result.stop.store(true); join(); }
+    void join() {
+        for (auto &worker : workers) if (worker.joinable()) worker.join();
+    }
+    void start(unsigned threads, bool hybrid, const uint8_t half[64],
+               const uint8_t *keybuf, uint64_t inter,
+               const std::array<uint8_t, PREIMAGE_BYTES> &raw,
+               const std::array<uint8_t, PREIMAGE_BYTES> &canonical,
+               const uint8_t target_be[32], uint32_t target7) {
+        const uint64_t space = hybrid ? 1ULL << 55 : 1ULL << 56;
+        const uint64_t offset = std::mt19937_64(std::random_device{}())() & (space - 1);
+        base_raw = raw;
+        base_canonical = canonical;
+        active.store(threads);
+        for (unsigned t = 0; t < threads; ++t) {
+            workers.emplace_back([this, space, offset, hybrid, half, keybuf, inter,
+                                  target_be, target7] {
+                try {
+                    alignas(16) uint8_t input[64], hash[32];
+                    std::memcpy(input, half, 64);
+                    std::memcpy(input + 32, base_raw.data() + PREFIX_BYTES, 15);
+                    input[47] = uint8_t(inter);
+                    for (int j = 0; j < 16; ++j)
+                        input[48 + j] = uint8_t(inter >> (8 * ((j + 1) & 7)));
+                    const auto *round_key = reinterpret_cast<const u128 *>(keybuf) +
+                                            (inter & 511);
+                    while (!result.stop.load(std::memory_order_relaxed)) {
+                        const uint64_t first = next.fetch_add(4096, std::memory_order_relaxed);
+                        if (first >= space) break;
+                        const uint64_t end = std::min(first + 4096, space);
+                        uint64_t processed = 0;
+                        for (uint64_t i = first; i < end &&
+                             !result.stop.load(std::memory_order_relaxed); ++i) {
+                            const uint64_t hi = ((offset + i) & (space - 1)) |
+                                                (hybrid ? 1ULL << 55 : 0);
+                            for (int j = 0; j < 7; ++j)
+                                input[40 + j] = uint8_t(hi >> (8 * j));
+                            haraka512_keyed(hash, input, round_key);
+                            ++processed;
+                            if (le32(hash + 28) > target7) continue;
+                            auto candidate = base_raw, verify = base_canonical;
+                            for (int j = 0; j < 7; ++j) {
+                                candidate[PREFIX_BYTES + 8 + j] = uint8_t(hi >> (8 * j));
+                                verify[PREFIX_BYTES + 8 + j] = uint8_t(hi >> (8 * j));
+                            }
+                            uint8_t full[32];
+                            if (!verus_host_full(full, verify.data(), verify.size()))
+                                throw std::runtime_error("CPU candidate full hash failed");
+                            if (meets_target(full, target_be)) {
+                                result.publish("CPU", candidate.data(), full);
+                                break;
+                            }
+                        }
+                        done.fetch_add(processed, std::memory_order_relaxed);
+                    }
+                } catch (...) { result.fail(std::current_exception()); }
+                active.fetch_sub(1);
+            });
+        }
+    }
+};
+
+static bool emit_result(const SoloResult &result) {
+    if (!result.found) return false;
+    std::cout << "WINNER " << result.worker << std::endl;
+    std::cout << "FOUND ";
+    print_hex(result.preimage.data(), result.preimage.size());
+    std::cout << ' ';
+    print_hex(result.digest.data(), result.digest.size());
+    std::cout << std::endl;
+    return true;
+}
+
+int verus_solo_main(int argc, char **argv) {
     try {
-        if (argc < 2 || argc > 3)
-            throw std::runtime_error("usage: solo_gpu.exe job.bin [extra_nonce_start]");
+        if (argc < 2)
+            throw std::runtime_error("usage: ccminer --verus-solo job.bin [extra_nonce_start] [--mode gpu|cpu|hybrid] [--threads N]");
+        std::string mode = "gpu";
+        const unsigned cores = std::thread::hardware_concurrency();
+        unsigned cpu_threads = cores > 2 ? cores - 2 : 1;
+        uint32_t scan_start = 0;
+        bool seed_set = false;
+        for (int i = 2; i < argc; ++i) {
+            const std::string arg = argv[i];
+            if (arg == "--mode" && i + 1 < argc) {
+                mode = argv[++i];
+                if (mode != "gpu" && mode != "cpu" && mode != "hybrid")
+                    throw std::runtime_error("mode must be gpu, cpu, or hybrid");
+            } else if (arg == "--threads" && i + 1 < argc) {
+                cpu_threads = unsigned(std::stoul(argv[++i]));
+                if (!cpu_threads || cpu_threads > 256)
+                    throw std::runtime_error("threads must be 1..256");
+            } else if (!seed_set && !arg.empty() && arg[0] != '-') {
+                scan_start = uint32_t(std::stoull(arg, nullptr, 0));
+                seed_set = true;
+            } else {
+                throw std::runtime_error("invalid argument: " + arg);
+            }
+        }
         std::ifstream in(argv[1], std::ios::binary);
         if (!in) throw std::runtime_error("cannot open job file");
         char magic[8];
@@ -155,7 +290,6 @@ int main(int argc, char **argv) {
         verus_host_clear_noncanonical(canonical.data());
         alignas(16) uint8_t keybuf[VERUS_KEYBUF_BYTES];
         uint8_t half[64];
-        const uint32_t scan_start = argc == 3 ? uint32_t(std::strtoul(argv[2], nullptr, 0)) : 0;
         uint32_t chosen = 0;
         uint64_t selector = 0;
         bool found_seed = false;
@@ -208,6 +342,49 @@ int main(int argc, char **argv) {
             verus_host_hash(reference, half, nonce, keybuf, 1);
             if (std::memcmp(fast, reference, 32))
                 throw std::runtime_error("selected nonce class failed CPU digest check");
+            alignas(16) uint8_t cpu_input[64], cpu_word[32];
+            std::memcpy(cpu_input, half, 64);
+            std::memcpy(cpu_input + 32, nonce, 15);
+            cpu_input[47] = uint8_t(inter);
+            for (int j = 0; j < 16; ++j)
+                cpu_input[48 + j] = uint8_t(inter >> (8 * ((j + 1) & 7)));
+            haraka512_keyed(cpu_word, cpu_input,
+                            reinterpret_cast<const u128 *>(keybuf) + (inter & 511));
+            if (le32(cpu_word + 28) != le32(reference + 28))
+                throw std::runtime_error("CPU shortcut target word disagrees with full hash");
+        }
+
+        const uint32_t target7 = uint32_t(target_be[0]) << 24 | uint32_t(target_be[1]) << 16 |
+                                 uint32_t(target_be[2]) << 8 | uint32_t(target_be[3]);
+        SoloResult result;
+        CpuSearch cpu(result);
+        if (mode == "cpu") {
+            std::cout << "READY mode=cpu threads=" << cpu_threads
+                      << " selector=0x" << std::hex << selector
+                      << " extra_nonce=0x" << chosen << " target7=0x" << target7
+                      << " fixed=0x" << fixed << " inter=0x" << inter
+                      << std::dec << " cpu_checks=64" << std::endl;
+            cpu.start(cpu_threads, false, half, keybuf, inter, raw, canonical,
+                      target_be, target7);
+            uint64_t previous = 0;
+            auto last = std::chrono::steady_clock::now();
+            while (cpu.active.load() && !result.stop.load()) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                const auto now = std::chrono::steady_clock::now();
+                const double seconds = std::chrono::duration<double>(now - last).count();
+                if (seconds >= 5) {
+                    const uint64_t count = cpu.done.load();
+                    std::cout << "RATE " << std::fixed << std::setprecision(2)
+                              << (count - previous) / seconds / 1e6
+                              << " MH/s total=" << count << std::endl;
+                    previous = count;
+                    last = now;
+                }
+            }
+            cpu.join();
+            if (result.error) std::rethrow_exception(result.error);
+            if (!emit_result(result)) std::cout << "DONE nonce space exhausted" << std::endl;
+            return 0;
         }
 
         cudaDeviceProp prop{};
@@ -222,15 +399,25 @@ int main(int argc, char **argv) {
         Device<BenchJob> dJob(1);
         check(cudaMemcpy(dK.p, keybuf, VP_KEY_SLOTS * 16, cudaMemcpyHostToDevice), "key upload");
         check(cudaMemcpy(dT.p, table, sizeof(table), cudaMemcpyHostToDevice), "table upload");
-        const uint32_t target7 = uint32_t(target_be[0]) << 24 | uint32_t(target_be[1]) << 16 |
-                                 uint32_t(target_be[2]) << 8 | uint32_t(target_be[3]);
         const uint32_t outer_start = uint32_t(rng()) & 0xffffffu;
-        std::cout << "READY GPU=" << prop.name << " selector=0x" << std::hex << selector
+        std::cout << "READY mode=" << mode << " GPU=" << prop.name
+                  << " threads=" << (mode == "hybrid" ? cpu_threads : 0)
+                  << " selector=0x" << std::hex << selector
                   << " extra_nonce=0x" << chosen << " target7=0x" << target7 << std::dec
-                  << " cpu_checks=64" << std::endl;
+                  << " fixed=0x" << std::hex << fixed << " inter=0x" << inter
+                  << std::dec << " cpu_checks=64" << std::endl;
+        if (mode == "hybrid") {
+            // CPU owns suffix bit 55 = 1; the GPU's inner counter stays below
+            // 2^31 and therefore owns bit 55 = 0 for every outer value.
+            cpu.start(cpu_threads, true, half, keybuf, inter, raw, canonical,
+                      target_be, target7);
+        }
+        const uint64_t inner_end = mode == "hybrid" ? 1ULL << 31 : 1ULL << 32;
         uint64_t total = 0, since_report = 0;
+        uint64_t cpu_previous = 0;
         auto last_report = std::chrono::steady_clock::now();
-        for (uint32_t outer_count = 0; outer_count < (1u << 24); ++outer_count) {
+        for (uint32_t outer_count = 0; outer_count < (1u << 24) &&
+                                      !result.stop.load(); ++outer_count) {
             const uint32_t outer = (outer_start + outer_count) & 0xffffffu;
             for (int i = 0; i < 3; ++i) {
                 raw[PREFIX_BYTES + 8 + i] = uint8_t(outer >> (8 * i));
@@ -258,10 +445,10 @@ int main(int argc, char **argv) {
                 }
                 std::cout << "GPU_CHECK 128/128" << std::endl;
             }
-            for (uint64_t next = 0; next < (1ULL << 32); ) {
-                const uint32_t count = uint32_t(std::min<uint64_t>(BATCH, (1ULL << 32) - next));
+            for (uint64_t next = 0; next < inner_end && !result.stop.load(); ) {
+                const uint32_t count = uint32_t(std::min<uint64_t>(BATCH, inner_end - next));
                 const uint64_t end = next + count;
-                while (next < end) {
+                while (next < end && !result.stop.load()) {
                     const uint32_t first = uint32_t(next);
                     const uint32_t span = uint32_t(end - next);
                     check(cudaMemset(dFound.p, 0xff, 8), "candidate reset");
@@ -288,30 +475,41 @@ int main(int argc, char **argv) {
                         if (!verus_host_full(digest, canonical.data(), canonical.size()))
                             throw std::runtime_error("full CPU candidate hash failed");
                         if (meets_target(digest, target_be)) {
-                            std::cout << "FOUND ";
-                            print_hex(raw.data(), raw.size());
-                            std::cout << ' ';
-                            print_hex(digest, 32);
-                            std::cout << std::endl;
-                            return 0;
+                            result.publish("GPU", raw.data(), digest);
+                            break;
                         }
                     }
                 }
                 const auto now = std::chrono::steady_clock::now();
                 const double seconds = std::chrono::duration<double>(now - last_report).count();
                 if (seconds >= 5.0) {
+                    const uint64_t cpu_total = cpu.done.load();
+                    const double gpu_rate = since_report / seconds / 1e6;
+                    const double cpu_rate = (cpu_total - cpu_previous) / seconds / 1e6;
                     std::cout << "RATE " << std::fixed << std::setprecision(2)
-                              << (since_report / seconds / 1e6) << " MH/s total="
-                              << total << std::endl;
+                              << (gpu_rate + cpu_rate) << " MH/s total="
+                              << (total + cpu_total) << " gpu=" << gpu_rate
+                              << " cpu=" << cpu_rate << std::endl;
                     last_report = now;
                     since_report = 0;
+                    cpu_previous = cpu_total;
                 }
             }
         }
-        std::cout << "DONE nonce space exhausted" << std::endl;
+        result.stop.store(true);
+        cpu.join();
+        if (result.error) std::rethrow_exception(result.error);
+        if (!emit_result(result)) std::cout << "DONE nonce space exhausted" << std::endl;
         return 0;
     } catch (const std::exception &e) {
         std::cerr << "ERROR " << e.what() << std::endl;
         return 1;
     }
 }
+
+#ifdef VERUS_SOLO_STANDALONE
+int main(int argc, char **argv) {
+    return argc > 1 && std::strcmp(argv[1], "--verus-solo") == 0
+        ? verus_solo_main(argc - 1, argv + 1) : verus_solo_main(argc, argv);
+}
+#endif

@@ -500,6 +500,7 @@ Options:\n\
       --hide-diff       hide submitted block and net difficulty (old mode)\n\
   -B, --background      run the miner in the background\n\
       --benchmark       run in offline benchmark mode\n\
+      --verus-solo JOB  mine a node-prepared Verus job (--mode gpu|cpu|hybrid)\n\
       --cputest         debug hashes from cpu algorithms\n\
   -c, --config=FILE     load a JSON-format configuration file\n\
   -V, --version         display version information and exit\n\
@@ -5072,10 +5073,15 @@ BOOL WINAPI ConsoleHandler(DWORD dwType)
 }
 #endif
 
+// The solo job path needs to run before CUDA device discovery, so CPU-only
+// mining works on a host without an NVIDIA GPU. Ordinary pool CLI is unchanged.
+extern int verus_solo_main(int argc, char **argv);
 int main(int argc, char *argv[])
 {
 	struct thr_info *thr;
 	int i;
+	if (argc > 1 && strcmp(argv[1], "--verus-solo") == 0)
+		return verus_solo_main(argc - 1, argv + 1);
 
 	// get opt_quiet early
 	parse_single_opt('q', argc, argv);
