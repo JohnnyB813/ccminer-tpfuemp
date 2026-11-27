@@ -53,6 +53,7 @@
   <!-- CUDA targets. A dev build (msbuild ... -p:DevArch=86) compiles for that one
        arch only, into its own output dirs, so its objects never reach a release link. -->
   <PropertyGroup>
+    <CudaBuildVersion Condition="'$(CudaBuildVersion)'==''">11.8</CudaBuildVersion>
     <CudaArchList Condition="'$(DevArch)'==''">compute_61,sm_61;compute_75,sm_75;compute_86,sm_86</CudaArchList>
     <CudaArchList Condition="'$(DevArch)'!=''">compute_$(DevArch),sm_$(DevArch)</CudaArchList>
   </PropertyGroup>
@@ -63,7 +64,7 @@
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
-    <Import Project="$(VCTargetsPath)\BuildCustomizations\CUDA 11.8.props" />
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\CUDA $(CudaBuildVersion).props" />
   </ImportGroup>
   <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
@@ -443,6 +444,7 @@
     <CudaCompile Include="algos\flex\flex.cu" />
     <CudaCompile Include="algos\minotaurx\minotaurx.cu" />
     <CudaCompile Include="algos\verus\verus.cu" />
+    <CudaCompile Include="tools\verus-solo\solo_gpu.cu" />
     <CudaCompile Include="algos\homescrypt\homescrypt.cu">
       <FastMath>false</FastMath>
       <FmadOptimization>false</FmadOptimization>
@@ -842,7 +844,7 @@
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
-    <Import Project="$(VCTargetsPath)\BuildCustomizations\CUDA 11.8.targets" />
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\CUDA $(CudaBuildVersion).targets" />
   </ImportGroup>
   <!-- Copy the required dlls -->
   <Target Name="AfterBuild">

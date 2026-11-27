@@ -1,4 +1,4 @@
-"""Feed Verus getblocktemplate jobs to solo_gpu and submit CPU-verified blocks."""
+"""Feed Verus getblocktemplate jobs to one ccminer CPU/GPU/hybrid binary."""
 
 from __future__ import annotations
 
@@ -251,12 +251,14 @@ def read_output(process: subprocess.Popen, lines: queue.Queue[str]) -> None:
         lines.put(line.rstrip("\r\n"))
 
 
-def launch_miner(work: Work, executable: Path,
+def launch_miner(work: Work, executable: Path, mode: str, cpu_threads: int,
                  lines: queue.Queue[str]) -> subprocess.Popen:
     job = ROOT / "jobs" / f"{work.template_id}.bin"
     work.job_file(job)
     start = secrets.randbits(32)
-    process = subprocess.Popen([str(executable), str(job), str(start)],
+    command = [str(executable), "--verus-solo", str(job), str(start),
+               "--mode", mode, "--threads", str(cpu_threads)]
+    process = subprocess.Popen(command,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                text=True, bufsize=1)
     reader = threading.Thread(target=read_output, args=(process, lines), daemon=True)
@@ -276,11 +278,12 @@ def stop_miner(process: subprocess.Popen | None) -> None:
         process.wait(timeout=5)
 
 
-def run_fixture(path: Path, executable: Path, target_hex: str) -> None:
+def run_fixture(path: Path, executable: Path, target_hex: str,
+                mode: str, cpu_threads: int) -> None:
     fixture = json.loads(path.read_text(encoding="utf-8"))
     work = build_work(fixture["template"], None, target_hex)
     lines: queue.Queue[str] = queue.Queue()
-    process = launch_miner(work, executable, lines)
+    process = launch_miner(work, executable, mode, cpu_threads, lines)
     deadline = time.monotonic() + 60
     try:
         while time.monotonic() < deadline:
@@ -303,7 +306,8 @@ def run_fixture(path: Path, executable: Path, target_hex: str) -> None:
         stop_miner(process)
 
 
-def run_live(config_path: Path, executable: Path) -> None:
+def run_live(config_path: Path, executable: Path, mode: str,
+             cpu_threads: int) -> None:
     config = json.loads(config_path.read_text(encoding="utf-8"))
     payout_address = config["payout_address"]
     address_script(payout_address)
@@ -385,7 +389,7 @@ def run_live(config_path: Path, executable: Path) -> None:
                 stop_miner(miner)
                 lines = queue.Queue()
                 current = work
-                miner = launch_miner(work, executable, lines)
+                miner = launch_miner(work, executable, mode, cpu_threads, lines)
                 job_started = time.monotonic()
                 print(f"JOB height={work.height} id={work.template_id} "
                       f"solution_v={work.solution_version} merged_chains={work.merged_chains} "
@@ -400,17 +404,24 @@ def run_live(config_path: Path, executable: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=ROOT / "private" / "rpc.json")
-    parser.add_argument("--gpu-exe", type=Path, default=ROOT / "solo_gpu.exe")
+    parser.add_argument("--miner", "--gpu-exe", dest="miner", type=Path,
+                        default=ROOT / "solo_gpu.exe")
+    parser.add_argument("--mode", choices=("gpu", "cpu", "hybrid"), default="gpu")
+    parser.add_argument("--cpu-threads", type=int,
+                        default=max(1, (os.cpu_count() or 2) - 2))
     parser.add_argument("--fixture", type=Path)
     parser.add_argument("--target", default="0000ffff" + "ff" * 28,
                         help="fixture-only 256-bit target, big endian hex")
     args = parser.parse_args()
-    if not args.gpu_exe.exists():
-        raise SystemExit(f"GPU miner missing: {args.gpu_exe}")
+    if not 1 <= args.cpu_threads <= 256:
+        parser.error("--cpu-threads must be 1..256")
+    if not args.miner.exists():
+        raise SystemExit(f"miner missing: {args.miner}")
     if args.fixture:
-        run_fixture(args.fixture, args.gpu_exe, args.target)
+        run_fixture(args.fixture, args.miner, args.target,
+                    args.mode, args.cpu_threads)
     else:
-        run_live(args.config, args.gpu_exe)
+        run_live(args.config, args.miner, args.mode, args.cpu_threads)
 
 
 if __name__ == "__main__":
