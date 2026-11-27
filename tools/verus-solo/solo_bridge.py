@@ -256,7 +256,9 @@ def launch_miner(work: Work, executable: Path, mode: str, cpu_threads: int,
     job = ROOT / "jobs" / f"{work.template_id}.bin"
     work.job_file(job)
     start = secrets.randbits(32)
-    command = [str(executable), "--verus-solo", str(job), str(start),
+    # Resolve ./miner as an executable path. POSIX does not search the current
+    # directory in PATH, and Path stringification drops a leading "./".
+    command = [str(executable.resolve()), "--verus-solo", str(job), str(start),
                "--mode", mode, "--threads", str(cpu_threads)]
     process = subprocess.Popen(command,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
