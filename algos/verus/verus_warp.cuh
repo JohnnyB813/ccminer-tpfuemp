@@ -1,4 +1,4 @@
-/* VerusHash 2.2: one hash per WARP. Device only.
+/* VerusHash 2.2: one full hash per warp. Device only.
  *
  * Why a warp: with 32 independent hashes a warp would run every one of the 8
  * data-dependent cases each iteration. With one hash per warp all branches are
@@ -7,6 +7,8 @@
  * Value layout (vl): a 128-bit value lives as one 32-bit word per lane, word
  * q = lane & 3, replicated in all 8 groups of 4 lanes. Every op keeps the
  * replicas identical, so any lane can serve as the source of a broadcast.
+ * The selected solo tail uses groups 0..3 and 4..7 for two independent
+ * Haraka inputs, one in each 16-lane half.
  *
  * The hash body lives once, in verus_portable.h (templates over KEY::V). This
  * file only provides the vl overloads and the warp key (vw_key, the
@@ -219,6 +221,20 @@ typedef struct vw_key {
 	__device__ __forceinline__ int dirty() const { return n; }
 } vw_key;
 
+/* The selected solo nonce class leaves the key pristine. Its Haraka tail
+ * needs read-only round keys, so it can skip the 1664-byte-per-warp write
+ * overlay and the map reads and warp barriers in vw_key::end_hash(). */
+typedef struct vw_pristine_key {
+	typedef vl V;
+	const uint32_t *K;
+	__device__ __forceinline__ vl rd(uint32_t i, vp_stats *) const
+	{
+		return vl_make(K[i * 4 + vw_q()]);
+	}
+	__device__ __forceinline__ vl pristine(uint32_t i) const { return rd(i, nullptr); }
+	__device__ __forceinline__ void end_hash() { }
+} vw_pristine_key;
+
 /* both writes of an iteration under one pair of __syncwarp; map[i1] is
  * written after map[i0], so i0 == i1 keeps the second value */
 __device__ __forceinline__ void vp_wr2(vw_key *o, uint32_t i0, vl v0, uint32_t i1, vl v1, vp_stats *)
@@ -288,11 +304,12 @@ __device__ __forceinline__ void vp_aes2_mix2(vl &s0, vl &s1, const vw_key *o, ui
  * (4 * source state + source word). MIX4_LAST's s2 equals MIX4's s2. */
 #define VW_MIX4_SRC 0xe6a25d194c08f7b3ULL
 
-/* Truncated keyed Haraka512, word 7: state k on group k (groups 4..7 repeat
- * 0..3), so each AES4 is two aesenc per lane instead of eight. */
-__device__ __forceinline__ uint32_t vp_haraka512_keyed_w7(const uint32_t in[16], const vw_key *o,
-                                                         uint32_t base, const uint32_t *T0,
-                                                         vp_stats *st)
+/* Truncated keyed Haraka512, word 7: state k on group k. Groups 4..7 may
+ * carry a second nonce, so each AES4 is two aesenc per lane instead of eight. */
+template<class KEY>
+__device__ __forceinline__ uint32_t vw_haraka512_keyed_w7_impl(const uint32_t in[16], const KEY *o,
+                                                                uint32_t base, const uint32_t *T0,
+                                                                vp_stats *st)
 {
 	const uint32_t lane = vw_lane(), k = (lane >> 2) & 3, j = lane & 15;
 	uint32_t w = 0;
@@ -309,7 +326,23 @@ __device__ __forceinline__ uint32_t vp_haraka512_keyed_w7(const uint32_t in[16],
 	/* AES4_LAST: only s2 (group 2) */
 	s = vp_aesenc(s, VW_HK(base + 34), T0);
 	s = vp_aesenc(s, VW_HK(base + 38), T0);
-	return __shfl_sync(VW_FULL, s.w, 2 * 4 + 2) ^ in[13];
+	/* Each 16-lane half may own a different nonce in the solo tail. */
+	return __shfl_sync(VW_FULL, s.w, (lane & 16) | (2 * 4 + 2)) ^ in[13];
+}
+
+__device__ __forceinline__ uint32_t vp_haraka512_keyed_w7(const uint32_t in[16], const vw_key *o,
+                                                         uint32_t base, const uint32_t *T0,
+                                                         vp_stats *st)
+{
+	return vw_haraka512_keyed_w7_impl(in, o, base, T0, st);
+}
+
+__device__ __forceinline__ uint32_t vp_haraka512_keyed_w7(const uint32_t in[16],
+                                                         const vw_pristine_key *o,
+                                                         uint32_t base, const uint32_t *T0,
+                                                         vp_stats *st)
+{
+	return vw_haraka512_keyed_w7_impl(in, o, base, T0, st);
 }
 
 /* shared bytes per warp: map + idx + ov */
