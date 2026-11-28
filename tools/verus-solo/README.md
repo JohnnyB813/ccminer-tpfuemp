@@ -9,6 +9,9 @@ The regular `ccminer -a verus` Stratum pool path remains available.
 The miner selects a four-byte PBaaS solution extra nonce giving the verified
 `case 0x14` fixed point. It computes the 276-step key once for that job and
 shares its pristine key and fixed CLHash result across CPU and GPU searches.
+The GPU tail reads that pristine key directly and hashes two selected nonces
+per warp, one in each 16-lane half. This removes the unused key-write overlay
+and allows three 512-thread blocks per Ada SM.
 On CPUs with VAES and AVX2, CPU-only and hybrid mode process two nonce suffixes
 per Haraka512 call using 256-bit VAES. The miner checks 64 nonce pairs against
 the scalar finalizer at job start, and fully rehashes every potential block.
@@ -92,8 +95,14 @@ py test_bridge_rpc.py --mode hybrid
 
 The fake RPC test checks a complete `submitmergedblock` payload against the
 fixture. Before mining, the binary checks 64 selected nonces against the full
-host VerusHash; GPU modes also compare 128 GPU target words with the host.
+host VerusHash; GPU modes also compare 258 GPU target words with the host,
+including an odd final pair and the high end of the 32-bit inner nonce.
 Run py bench_cpu_finalizer.py --threads 4 to compare scalar and VAES2 CPU
 scan rates on the same saved job. It uses an all-zero target, reports two
 five-second samples for each path, and terminates both miners.
+Run py bench_gpu_kernel.py BASELINE_EXE CANDIDATE_EXE to compare two GPU
+builds on the same saved job. In a short RTX 4060 test, the released kernel
+measured 266.25 MH/s and the two-nonce kernel with a four-million-nonce
+batch measured 646.00 MH/s (2.43x). These are
+selected-class scan rates, not sustained whole-miner rates.
 Generated jobs and RPC credentials stay under ignored `jobs/` and `private/`.

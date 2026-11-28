@@ -55,10 +55,12 @@ template<class T> struct Device {
 
 constexpr size_t PREIMAGE_BYTES = 1487;
 constexpr size_t PREFIX_BYTES = 1472;
-constexpr uint32_t BATCH = 1u << 20;
+// A larger launch amortizes the result reset and readback. On an RTX 4060
+// this is a short kernel while preserving prompt job cancellation.
+constexpr uint32_t BATCH = 1u << 22;
 constexpr char JOB_MAGIC[8] = {'V','R','S','O','L','O','1','\0'};
 
-__global__ void __launch_bounds__(1024, 1) solo_kernel(
+__global__ void __launch_bounds__(512, 3) solo_kernel(
     const uint32_t *gK, const uint32_t *gT0, const BenchJob *job,
     uint64_t inter, uint32_t first, uint32_t count, uint32_t target7,
     uint64_t *found, uint32_t *w7out)
@@ -66,22 +68,22 @@ __global__ void __launch_bounds__(1024, 1) solo_kernel(
     extern __shared__ __align__(16) uint8_t smem[];
     uint32_t *sT = (uint32_t *)smem;
     uint32_t *sK = sT + VW_T_WORDS;
-    uint8_t *wsm = (uint8_t *)(sK + VP_KEY_SLOTS * 4);
     for (int i = threadIdx.x; i < VW_T_WORDS; i += blockDim.x) {
         const uint32_t v = gT0[i & 255], r = 8 * (i >> 8);
         sT[i] = r ? (v << r) | (v >> (32 - r)) : v;
     }
     for (int i = threadIdx.x; i < VP_KEY_SLOTS * 4; i += blockDim.x) sK[i] = gK[i];
     __syncthreads();
-    uint8_t *wbase = wsm + (threadIdx.x >> 5) * VW_WARP_SMEM;
-    uint32_t *ov = (uint32_t *)wbase;
-    uint16_t *idx = (uint16_t *)(wbase + VP_OVL_SLOTS * 16);
-    uint8_t *map = wbase + VP_OVL_SLOTS * 18;
-    vw_key o;
-    vw_key_init(&o, sK, map, idx, ov);
+    vw_pristine_key o{sK};
     const uint32_t gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const uint32_t nw = (gridDim.x * blockDim.x) >> 5;
-    for (uint32_t i = gw; i < count; i += nw) {
+    const uint32_t half = (threadIdx.x >> 4) & 1;
+    const uint32_t pairs = (count + 1) >> 1;
+    for (uint32_t pair = gw; pair < pairs; pair += nw) {
+        // The Haraka warp already holds two copies of the four-state layout.
+        // Give the two 16-lane halves different nonces. The final shuffle
+        // stays inside each half, and the odd last pair is safely padded.
+        const uint32_t i = pair * 2 + half;
         const uint32_t n = first + i;
         uint32_t cb[16];
         uint8_t out[32];
@@ -90,7 +92,7 @@ __global__ void __launch_bounds__(1024, 1) solo_kernel(
         // CLHash intermediate after 32 rounds. The host checked that claim
         // before launch, so each warp only needs the keyed Haraka tail.
         vp_hash_tail(out, 0, cb, inter, &o, sT, (vp_stats *)0);
-        if (vw_lane() == 0) {
+        if ((vw_lane() & 15) == 0 && i < count) {
             const uint32_t w7 = (uint32_t)out[28] | (uint32_t)out[29] << 8 |
                                 (uint32_t)out[30] << 16 | (uint32_t)out[31] << 24;
             if (w7out) w7out[i] = w7;
@@ -448,12 +450,13 @@ int verus_solo_main(int argc, char **argv) {
 
         cudaDeviceProp prop{};
         check(cudaGetDeviceProperties(&prop, 0), "GPU device");
-        const int tpb = 1024, blocks = prop.multiProcessorCount;
-        const size_t smem = 1024u * vw_aes_tables(prop.major) + VP_KEY_SLOTS * 16u +
-                            size_t(tpb / 32) * VW_WARP_SMEM;
+        // With no per-warp write overlay, three 512-thread blocks can reside
+        // on an Ada SM and fill its 48 warp slots.
+        const int tpb = 512, blocks = prop.multiProcessorCount * 3;
+        const size_t smem = 1024u * vw_aes_tables(prop.major) + VP_KEY_SLOTS * 16u;
         check(cudaFuncSetAttribute(solo_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                    int(smem)), "GPU shared memory");
-        Device<uint32_t> dK(VP_KEY_SLOTS * 4), dT(256), dW7(128);
+        Device<uint32_t> dK(VP_KEY_SLOTS * 4), dT(256), dW7(129);
         Device<uint64_t> dFound(1);
         Device<BenchJob> dJob(1);
         check(cudaMemcpy(dK.p, keybuf, VP_KEY_SLOTS * 16, cudaMemcpyHostToDevice), "key upload");
@@ -490,21 +493,25 @@ int verus_solo_main(int argc, char **argv) {
             check(cudaMemcpy(dJob.p, &job, sizeof job, cudaMemcpyHostToDevice), "job upload");
             if (outer_count == 0) {
                 check(cudaMemset(dFound.p, 0xff, 8), "GPU test init");
-                solo_kernel<<<blocks, tpb, smem>>>(dK.p, dT.p, dJob.p, inter, 0, 128,
-                                                  0, nullptr, dW7.p);
-                check(cudaGetLastError(), "GPU test launch");
-                std::array<uint32_t, 128> words{};
-                check(cudaMemcpy(words.data(), dW7.p, words.size() * 4,
-                                 cudaMemcpyDeviceToHost), "GPU test copy");
-                for (uint32_t i = 0; i < words.size(); ++i) {
-                    uint8_t n[15], digest[32];
-                    std::memcpy(n, nonce, 15);
-                    put32(n + 11, i);
-                    verus_host_hash(digest, half, n, keybuf, 1);
-                    if (words[i] != le32(digest + 28))
-                        throw std::runtime_error("GPU and CPU disagree on selected work");
+                // An odd count exercises the padded high half. The second
+                // range exercises the full 32-bit inner nonce up to UINT32_MAX.
+                for (const uint32_t test_first : {0u, 0xffffff7fu}) {
+                    solo_kernel<<<blocks, tpb, smem>>>(dK.p, dT.p, dJob.p, inter,
+                                                      test_first, 129, 0, nullptr, dW7.p);
+                    check(cudaGetLastError(), "GPU test launch");
+                    std::array<uint32_t, 129> words{};
+                    check(cudaMemcpy(words.data(), dW7.p, words.size() * 4,
+                                     cudaMemcpyDeviceToHost), "GPU test copy");
+                    for (uint32_t i = 0; i < words.size(); ++i) {
+                        uint8_t n[15], digest[32];
+                        std::memcpy(n, nonce, 15);
+                        put32(n + 11, test_first + i);
+                        verus_host_hash(digest, half, n, keybuf, 1);
+                        if (words[i] != le32(digest + 28))
+                            throw std::runtime_error("GPU and CPU disagree on selected work");
+                    }
                 }
-                std::cout << "GPU_CHECK 128/128" << std::endl;
+                std::cout << "GPU_CHECK 258/258" << std::endl;
             }
             for (uint64_t next = 0; next < inner_end && !result.stop.load(); ) {
                 const uint32_t count = uint32_t(std::min<uint64_t>(BATCH, inner_end - next));
