@@ -12,8 +12,8 @@ shares its pristine key and fixed CLHash result across CPU and GPU searches.
 On CPUs with VAES and AVX2, CPU-only and hybrid mode process two nonce suffixes
 per Haraka512 call using 256-bit VAES. The miner checks 64 nonce pairs against
 the scalar finalizer at job start, and fully rehashes every potential block.
-Other CPUs use the existing scalar AES-NI finalizer. Set VERUS_SOLO_VAES=0
-to compare scalar speed, or VERUS_SOLO_VAES=1 to require VAES.
+Other supported CPUs use the existing scalar AES-NI finalizer. Set
+VERUS_SOLO_VAES=0 to compare scalar speed, or VERUS_SOLO_VAES=1 to require VAES.
 In hybrid mode the GPU scans nonce suffix bit 55 = 0 and CPU threads scan bit
 55 = 1, so they cannot repeat each other's nonces. Each potential block is
 fully rehashed on the CPU before the bridge submits it. The miner rejects
