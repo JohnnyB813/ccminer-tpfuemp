@@ -417,6 +417,9 @@
     <ClCompile Include="algos\verus\verus_host.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="tools\verus-solo\solo_vaes2.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="algos\cryptonight\mman.c">
       <Filter>Source Files\cryptonight\bbr</Filter>
     </ClCompile>

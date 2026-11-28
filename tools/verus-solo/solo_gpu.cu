@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 #include "../../algos/verus/verus_warp.cuh"
 #include "../../algos/verus/verus_host.h"
+#include "solo_vaes2.h"
 extern "C" {
 #include "../../algos/verus/haraka.h"
 }
@@ -14,11 +15,13 @@ extern "C" {
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -173,7 +176,7 @@ struct CpuSearch {
                const uint8_t *keybuf, uint64_t inter,
                const std::array<uint8_t, PREIMAGE_BYTES> &raw,
                const std::array<uint8_t, PREIMAGE_BYTES> &canonical,
-               const uint8_t target_be[32], uint32_t target7) {
+               const uint8_t target_be[32], uint32_t target7, bool use_vaes) {
         const uint64_t space = hybrid ? 1ULL << 55 : 1ULL << 56;
         const uint64_t offset = std::mt19937_64(std::random_device{}())() & (space - 1);
         base_raw = raw;
@@ -181,7 +184,7 @@ struct CpuSearch {
         active.store(threads);
         for (unsigned t = 0; t < threads; ++t) {
             workers.emplace_back([this, space, offset, hybrid, half, keybuf, inter,
-                                  target_be, target7] {
+                                  target_be, target7, use_vaes] {
                 try {
                     alignas(16) uint8_t input[64], hash[32];
                     std::memcpy(input, half, 64);
@@ -191,31 +194,49 @@ struct CpuSearch {
                         input[48 + j] = uint8_t(inter >> (8 * ((j + 1) & 7)));
                     const auto *round_key = reinterpret_cast<const u128 *>(keybuf) +
                                             (inter & 511);
+                    std::unique_ptr<void, void (*)(void *)> vaes(nullptr,
+                                                                 verus_solo_vaes2_destroy);
+                    if (use_vaes)
+                        vaes.reset(verus_solo_vaes2_create(input, round_key));
+                    auto verify_word = [&](uint64_t hi, uint32_t word) {
+                        if (word > target7) return;
+                        auto candidate = base_raw, verify = base_canonical;
+                        for (int j = 0; j < 7; ++j) {
+                            candidate[PREFIX_BYTES + 8 + j] = uint8_t(hi >> (8 * j));
+                            verify[PREFIX_BYTES + 8 + j] = uint8_t(hi >> (8 * j));
+                        }
+                        uint8_t full[32];
+                        if (!verus_host_full(full, verify.data(), verify.size()))
+                            throw std::runtime_error("CPU candidate full hash failed");
+                        if (meets_target(full, target_be))
+                            result.publish("CPU", candidate.data(), full);
+                    };
                     while (!result.stop.load(std::memory_order_relaxed)) {
                         const uint64_t first = next.fetch_add(4096, std::memory_order_relaxed);
                         if (first >= space) break;
                         const uint64_t end = std::min(first + 4096, space);
                         uint64_t processed = 0;
                         for (uint64_t i = first; i < end &&
-                             !result.stop.load(std::memory_order_relaxed); ++i) {
-                            const uint64_t hi = ((offset + i) & (space - 1)) |
-                                                (hybrid ? 1ULL << 55 : 0);
-                            for (int j = 0; j < 7; ++j)
-                                input[40 + j] = uint8_t(hi >> (8 * j));
-                            haraka512_keyed(hash, input, round_key);
-                            ++processed;
-                            if (le32(hash + 28) > target7) continue;
-                            auto candidate = base_raw, verify = base_canonical;
-                            for (int j = 0; j < 7; ++j) {
-                                candidate[PREFIX_BYTES + 8 + j] = uint8_t(hi >> (8 * j));
-                                verify[PREFIX_BYTES + 8 + j] = uint8_t(hi >> (8 * j));
-                            }
-                            uint8_t full[32];
-                            if (!verus_host_full(full, verify.data(), verify.size()))
-                                throw std::runtime_error("CPU candidate full hash failed");
-                            if (meets_target(full, target_be)) {
-                                result.publish("CPU", candidate.data(), full);
-                                break;
+                             !result.stop.load(std::memory_order_relaxed); ) {
+                            const uint64_t hi0 = ((offset + i) & (space - 1)) |
+                                                 (hybrid ? 1ULL << 55 : 0);
+                            if (use_vaes && i + 1 < end) {
+                                const uint64_t hi1 = ((offset + i + 1) & (space - 1)) |
+                                                     (hybrid ? 1ULL << 55 : 0);
+                                uint32_t words[2];
+                                verus_solo_vaes2_words(vaes.get(), hi0, hi1, words);
+                                processed += 2;
+                                i += 2;
+                                verify_word(hi0, words[0]);
+                                if (!result.stop.load(std::memory_order_relaxed))
+                                    verify_word(hi1, words[1]);
+                            } else {
+                                for (int j = 0; j < 7; ++j)
+                                    input[40 + j] = uint8_t(hi0 >> (8 * j));
+                                haraka512_keyed(hash, input, round_key);
+                                ++processed;
+                                ++i;
+                                verify_word(hi0, le32(hash + 28));
                             }
                         }
                         done.fetch_add(processed, std::memory_order_relaxed);
@@ -262,6 +283,16 @@ int verus_solo_main(int argc, char **argv) {
                 seed_set = true;
             } else {
                 throw std::runtime_error("invalid argument: " + arg);
+            }
+        }
+        bool use_vaes = mode != "gpu" && verus_solo_vaes2_available();
+        if (mode != "gpu") {
+            if (const char *setting = std::getenv("VERUS_SOLO_VAES")) {
+                if (std::strcmp(setting, "0") == 0) use_vaes = false;
+                else if (std::strcmp(setting, "1") == 0) {
+                    if (!use_vaes)
+                        throw std::runtime_error("VAES requested but CPU lacks VAES/AVX2");
+                } else throw std::runtime_error("VERUS_SOLO_VAES must be 0 or 1");
             }
         }
         std::ifstream in(argv[1], std::ios::binary);
@@ -330,6 +361,13 @@ int verus_solo_main(int argc, char **argv) {
             uint8_t nonce[15], fast[32], reference[32];
             std::memcpy(nonce, raw.data() + PREFIX_BYTES, 15);
             for (int j = 8; j < 15; ++j) nonce[j] = uint8_t(rng());
+            // Include byte carries and the upper edge of the 56-bit suffix.
+            constexpr uint64_t edges[] = {0, 1, 0xffffff, 0x1000000,
+                                          0xffffffff, 0x100000000,
+                                          0xfffffffffffffe, 0xffffffffffffff};
+            if (trial < 8)
+                for (int j = 0; j < 7; ++j)
+                    nonce[8 + j] = uint8_t(edges[trial] >> (8 * j));
             uint32_t cb[16];
             std::memcpy(cb, half, 64);
             std::memcpy(reinterpret_cast<uint8_t *>(cb) + 32, nonce, 15);
@@ -352,6 +390,26 @@ int verus_solo_main(int argc, char **argv) {
                             reinterpret_cast<const u128 *>(keybuf) + (inter & 511));
             if (le32(cpu_word + 28) != le32(reference + 28))
                 throw std::runtime_error("CPU shortcut target word disagrees with full hash");
+            if (use_vaes) {
+                uint64_t hi0 = 0;
+                for (int j = 0; j < 7; ++j) hi0 |= uint64_t(nonce[8 + j]) << (8 * j);
+                const uint64_t hi1 = (hi0 + 1 + uint64_t(trial) * 0x100000001ULL) &
+                                     ((1ULL << 56) - 1);
+                std::unique_ptr<void, void (*)(void *)> vaes(
+                    verus_solo_vaes2_create(cpu_input,
+                        reinterpret_cast<const u128 *>(keybuf) + (inter & 511)),
+                    verus_solo_vaes2_destroy);
+                uint32_t words[2];
+                verus_solo_vaes2_words(vaes.get(), hi0, hi1, words);
+                if (words[0] != le32(cpu_word + 28))
+                    throw std::runtime_error("VAES first nonce disagrees with full hash");
+                for (int j = 0; j < 7; ++j)
+                    cpu_input[40 + j] = uint8_t(hi1 >> (8 * j));
+                haraka512_keyed(cpu_word, cpu_input,
+                    reinterpret_cast<const u128 *>(keybuf) + (inter & 511));
+                if (words[1] != le32(cpu_word + 28))
+                    throw std::runtime_error("VAES second nonce disagrees with scalar hash");
+            }
         }
 
         const uint32_t target7 = uint32_t(target_be[0]) << 24 | uint32_t(target_be[1]) << 16 |
@@ -360,12 +418,13 @@ int verus_solo_main(int argc, char **argv) {
         CpuSearch cpu(result);
         if (mode == "cpu") {
             std::cout << "READY mode=cpu threads=" << cpu_threads
+                      << " cpu_finalizer=" << (use_vaes ? "vaes2" : "scalar")
                       << " selector=0x" << std::hex << selector
                       << " extra_nonce=0x" << chosen << " target7=0x" << target7
                       << " fixed=0x" << fixed << " inter=0x" << inter
                       << std::dec << " cpu_checks=64" << std::endl;
             cpu.start(cpu_threads, false, half, keybuf, inter, raw, canonical,
-                      target_be, target7);
+                      target_be, target7, use_vaes);
             uint64_t previous = 0;
             auto last = std::chrono::steady_clock::now();
             while (cpu.active.load() && !result.stop.load()) {
@@ -402,6 +461,8 @@ int verus_solo_main(int argc, char **argv) {
         const uint32_t outer_start = uint32_t(rng()) & 0xffffffu;
         std::cout << "READY mode=" << mode << " GPU=" << prop.name
                   << " threads=" << (mode == "hybrid" ? cpu_threads : 0)
+                  << (mode == "hybrid" ? (use_vaes ? " cpu_finalizer=vaes2" :
+                                           " cpu_finalizer=scalar") : "")
                   << " selector=0x" << std::hex << selector
                   << " extra_nonce=0x" << chosen << " target7=0x" << target7 << std::dec
                   << " fixed=0x" << std::hex << fixed << " inter=0x" << inter
@@ -410,7 +471,7 @@ int verus_solo_main(int argc, char **argv) {
             // CPU owns suffix bit 55 = 1; the GPU's inner counter stays below
             // 2^31 and therefore owns bit 55 = 0 for every outer value.
             cpu.start(cpu_threads, true, half, keybuf, inter, raw, canonical,
-                      target_be, target7);
+                      target_be, target7, use_vaes);
         }
         const uint64_t inner_end = mode == "hybrid" ? 1ULL << 31 : 1ULL << 32;
         uint64_t total = 0, since_report = 0;

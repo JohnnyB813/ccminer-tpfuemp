@@ -11,12 +11,14 @@ nvcc -O3 -std=c++17 -arch="$GPU_ARCH" --use_fast_math \
     -Xcompiler=-maes,-mpclmul,-mssse3,-mavx2,-pthread \
     -c solo_gpu.cu -o build-linux/solo_gpu.o
 
+g++ -O3 -std=c++17 -c solo_vaes2.cpp -o build-linux/solo_vaes2.o
+
 for source in verus_host haraka haraka_portable verus_clhash; do
     gcc -O3 -maes -mpclmul -mssse3 -mavx2 -I../../algos/verus \
         -c "../../algos/verus/${source}.c" -o "build-linux/${source}.o"
 done
 
 g++ -O3 -o ccminer-verus-solo-linux-x86_64 \
-    build-linux/solo_gpu.o build-linux/verus_host.o build-linux/haraka.o \
+    build-linux/solo_gpu.o build-linux/solo_vaes2.o build-linux/verus_host.o build-linux/haraka.o \
     build-linux/haraka_portable.o build-linux/verus_clhash.o \
     -L"${CUDA_HOME:-/usr/local/cuda}/lib64" -lcudart_static -ldl -lrt -pthread
