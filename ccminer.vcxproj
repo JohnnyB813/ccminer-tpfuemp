@@ -323,6 +323,9 @@
     <ClCompile Include="algos\verus\haraka_portable.c" />
     <ClCompile Include="algos\verus\verus_clhash.c" />
     <ClCompile Include="algos\verus\verus_host.c" />
+    <ClCompile Include="tools\verus-solo\solo_vaes2.cpp">
+      <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
+    </ClCompile>
     <ClCompile Include="algos\cryptonight\cpu\c_keccak.c" />
     <ClCompile Include="algos\equihash\blake2\blake2bx.cpp">
       <EnableEnhancedInstructionSet Condition="'$(Platform)'=='Win32'">StreamingSIMDExtensions</EnableEnhancedInstructionSet>

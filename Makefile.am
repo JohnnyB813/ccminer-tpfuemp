@@ -61,7 +61,7 @@ ccminer_SOURCES	= compat/elist.h miner.h compat.h \
 			  algos/minotaurx/minotaurx.h algos/minotaurx/minotaurx_kat.h \
 			  algos/homescrypt/homescrypt.cu algos/homescrypt/homescrypt_hash.cpp \
 			  algos/homescrypt/homescrypt.h algos/homescrypt/homescrypt_kat.h \
-			  algos/verus/verus.cu tools/verus-solo/solo_gpu.cu algos/verus/verus_host.c algos/verus/haraka.c \
+			  algos/verus/verus.cu tools/verus-solo/solo_gpu.cu tools/verus-solo/solo_vaes2.cpp tools/verus-solo/solo_vaes2.h algos/verus/verus_host.c algos/verus/haraka.c \
 			  algos/verus/haraka_portable.c algos/verus/verus_clhash.c \
 			  algos/verus/verus_host.h algos/verus/verus_portable.h algos/verus/verus_warp.cuh algos/verus/verus-kat.h algos/verus/haraka.h \
 			  algos/verus/haraka_portable.h algos/verus/verus_clhash.h algos/verus/verus_clhash_iter.h algos/verus/verus-simd.h algos/verus/verus_host_target.h \

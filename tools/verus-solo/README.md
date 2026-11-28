@@ -9,6 +9,11 @@ The regular `ccminer -a verus` Stratum pool path remains available.
 The miner selects a four-byte PBaaS solution extra nonce giving the verified
 `case 0x14` fixed point. It computes the 276-step key once for that job and
 shares its pristine key and fixed CLHash result across CPU and GPU searches.
+On CPUs with VAES and AVX2, CPU-only and hybrid mode process two nonce suffixes
+per Haraka512 call using 256-bit VAES. The miner checks 64 nonce pairs against
+the scalar finalizer at job start, and fully rehashes every potential block.
+Other CPUs use the existing scalar AES-NI finalizer. Set VERUS_SOLO_VAES=0
+to compare scalar speed, or VERUS_SOLO_VAES=1 to require VAES.
 In hybrid mode the GPU scans nonce suffix bit 55 = 0 and CPU threads scan bit
 55 = 1, so they cannot repeat each other's nonces. Each potential block is
 fully rehashed on the CPU before the bridge submits it. The miner rejects
@@ -88,4 +93,7 @@ py test_bridge_rpc.py --mode hybrid
 The fake RPC test checks a complete `submitmergedblock` payload against the
 fixture. Before mining, the binary checks 64 selected nonces against the full
 host VerusHash; GPU modes also compare 128 GPU target words with the host.
+Run py bench_cpu_finalizer.py --threads 4 to compare scalar and VAES2 CPU
+scan rates on the same saved job. It uses an all-zero target, reports two
+five-second samples for each path, and terminates both miners.
 Generated jobs and RPC credentials stay under ignored `jobs/` and `private/`.
